@@ -1,7 +1,7 @@
 #!/bin/bash
 
 make clean && make
-clang++ -g -emit-llvm -S -O3 primate.cpp -o primate.ll
+clang++ -g -emit-llvm -S -O0 primate.cpp -o primate.ll
 LLVM_PROFILE_FILE="main.profraw" ./main
 llvm-profdata merge main.profraw -o main.profdata
 llvm-cov export -format=text -instr-profile main.profdata ./main -sources primate.cpp > prof.json

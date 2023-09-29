@@ -42,9 +42,11 @@ Boundary Conditions: empty set for flow value. identified by no successors.
 #include <ostream>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <sstream>
 #include <stdlib.h>
 #include <algorithm>
+#include <random>
 #include <math.h>
 #include <map>
 #include <tuple>
@@ -54,6 +56,7 @@ Boundary Conditions: empty set for flow value. identified by no successors.
 #define MAX_PERF 0
 #define BALANCE 1
 #define IO_W 64
+#define RATE (0.05)
 
 using namespace llvm;
 
@@ -81,20 +84,23 @@ namespace {
 
             // domain vector to store all definitions and function arguments
             std::string filename;
+            unsigned long long numTotalInst;
+            unsigned long long numTotalExeCount;
             int numProfSegments;
             int **profSegments;
             int numProfRegions;
             int **profRegions;
             int numProfBranches;
             int **profBranches;
+            int *numInstPerSeg;
             double avgExeCountPerInst;
             int numInst;
             int numLine;
-            int *instPerLine;
             int inputDoneLine;
             std::map<int, std::map<int, Value*>*> lineToBBs;
             ValueMap<Value*, std::string> varNameMap;
             ValueMap<Value*, int> varRegMap;
+            std::map<std::string, std::vector<std::pair<std::string, int>>*> varTypeMap;
 
             // tuple: start index; end index; end index of the second flit if the header spans across two flits, default -1
             ValueMap<Value*, std::tuple<int, int, int>> inputInstRange;
@@ -968,11 +974,67 @@ namespace {
                         auto* dbgInst = dyn_cast<DbgDeclareInst>(&*inst_it);
                         auto* instMeta = cast<MetadataAsValue>(dbgInst->getOperand(0))->getMetadata();
                         Value* inst = cast<ValueAsMetadata>(instMeta)->getValue();
-                        auto name = cast<DILocalVariable>(cast<MetadataAsValue>(dbgInst->getOperand(1))->getMetadata())->getName();
-                        varNameMap[inst] = name.str();
+                        auto *varMeta = cast<DILocalVariable>(cast<MetadataAsValue>(dbgInst->getOperand(1))->getMetadata());
+                        std::string name = (varMeta->getName()).str();
+                        varNameMap[inst] = name;
+                        // errs() << "name: " << name << "\n";
+                        std::vector<int> fieldWidth;
+                        if (isa<AllocaInst>(*inst)) {
+                            auto* aInst = dyn_cast<AllocaInst>(inst);
+                            Type *aType = aInst->getAllocatedType();
+                            if (isa<StructType>(*aType)) {
+                                auto stype = dyn_cast<StructType>(aType);
+                                for (auto elem = stype->element_begin(); elem != stype->element_end(); elem++) {
+                                    if (isa<IntegerType>(**elem)) {
+                                        unsigned elemWidth = (*elem)->getIntegerBitWidth();
+                                        fieldWidth.emplace_back(elemWidth);
+                                    } else {
+                                        errs() << "Each field must be integer type\n";
+                                        exit(1);
+                                    }
+                                }
+                            }
+                        }
                         if (name != "top_intf") {
                             varRegMap[inst] = i;
                             i++;
+
+                            // record the types
+                            DIType* varType = varMeta->getType();
+                            DICompositeType* varBaseType;
+                            std::string varTypeName;
+                            if (isa<DIDerivedType>(*varType)) {
+                                varTypeName = ((cast<DIDerivedType>(varType))->getName()).str();
+                                auto *tmp = (cast<DIDerivedType>(varType))->getBaseType();
+                                if (isa<DICompositeType>(*tmp)) {
+                                    varBaseType = cast<DICompositeType>(tmp);
+                                } else {
+                                    continue;
+                                }
+                            } else if (isa<DICompositeType>(*varType)) {
+                                varBaseType = cast<DICompositeType>(varType);
+                                varTypeName = (varBaseType->getName()).str();
+                            } else {
+                                continue;
+                            }
+                            if (varTypeMap.find(varTypeName) == varTypeMap.end()) {
+                                if (varBaseType->getTag() == 0x0013) {  // The ID of DW_TAG_structure_type
+                                    varTypeMap[varTypeName] = new std::vector<std::pair<std::string, int>>();
+                                    DINodeArray fieldArray = varBaseType->getElements();
+                                    int j = 0;
+                                    for (auto field_it = fieldArray.begin(); field_it != fieldArray.end(); field_it++) {
+                                        if (isa<DIDerivedType>(**field_it)) {
+                                            DIDerivedType* field = cast<DIDerivedType>(*field_it);
+                                            if (field->getTag() == 0x000d) { // The ID of DW_TAG_member
+                                                auto fieldName = field->getName();
+                                                varTypeMap[varTypeName]->emplace_back(std::make_pair(fieldName, fieldWidth[j]));
+                                                j++;
+                                                // errs() << "Type: " << varTypeName << ", Field: " << fieldName << ", Size: " << field->getSizeInBits() << "\n";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1171,7 +1233,7 @@ namespace {
                 return 0;
             }
 
-            int getSegExeCount(const unsigned line, const unsigned col, int &segLineStart, int &segColStart, int &segLineEnd, int &segColEnd) {
+            int getSegExeCount(const unsigned line, const unsigned col, int &segId, int &segLineStart, int &segColStart, int &segLineEnd, int &segColEnd) {
                 int segExeCount = 0;
                 for (int i = 0; i < numProfSegments; i++) {
                     if (profSegments[i][3] == 0) {
@@ -1180,13 +1242,19 @@ namespace {
                     }
                     segLineStart = profSegments[i][0];
                     segColStart = profSegments[i][1];
-                    if ((line < segLineStart) || (line == segLineStart && col < segLineStart)) {
+                    if ((line < segLineStart) || (line == segLineStart && col < segColStart)) {
                         continue;
+                    } else if (i+1 < numProfSegments) {
+                        if (line > profSegments[i+1][0] || (line == profSegments[i+1][0] && col >= profSegments[i+1][1])) {
+                            continue;
+                        }
                     }
+
                     segExeCount = profSegments[i][2];
+                    segId = i;
                     for (int j = i+1; j < numProfSegments; j++) {
-                        if (profSegments[j][4] == 0) {
-                            // skip this entry if it is not an entry to a new region
+                        if (profSegments[j][3] == 0) {
+                            // skip this entry if it has no count
                             continue;
                         }
                         segLineEnd = profSegments[j][0];
@@ -1199,31 +1267,52 @@ namespace {
             }
 
             Function* initializeExeCount(Module &M) {
+                numInstPerSeg = new int[numProfSegments];
+                for (int i = 0; i < numProfSegments; i++) {
+                    numInstPerSeg[i] = 0;
+                }
                 for (Module::iterator mi = M.begin(); mi != M.end(); mi++) {
                     if ((mi->getName()).find("primate_main") != StringRef::npos) {
-                        int numTotalInst = 0;
-                        int numTotalExeCount = 0;
+                        numTotalInst = 0;
+                        numTotalExeCount = 0;
                         int profSegExeCount;
                         int profSegLineStart = 0;
                         int profSegColStart = 0;
                         int profSegLineEnd = 0;
                         int profSegColEnd = 0;
+                        int segId = 0;
                         for (Function::iterator bi = mi->begin(); bi != mi->end(); bi++) {
                             BasicBlock *bb = &*bi;
+                            bool newBB = true;
+                            int numInstWODbg = 0;
                             for (auto ii = bb->begin(); ii != bb->end(); ++ii) {
                                 Instruction *inst = dyn_cast<Instruction>(&*ii);
-                                if (DILocation *Loc = inst->getDebugLoc()) {
-                                    unsigned line = Loc->getLine();
-                                    unsigned col = Loc->getColumn();
-                                    numTotalInst += 1;
-                                    if ((line < profSegLineStart) || (line == profSegLineStart && col < profSegColStart) || (line == profSegLineEnd && col >= profSegColEnd) || (line > profSegLineEnd)) {
-                                        profSegExeCount = getSegExeCount(line, col, profSegLineStart, profSegColStart, profSegLineEnd, profSegColEnd);
+                                if (!(isa<CallInst>(*inst) || isa<AllocaInst>(*inst) || isa<PHINode>(*inst))) {
+                                    if (DILocation *Loc = inst->getDebugLoc()) {
+                                        unsigned line = Loc->getLine();
+                                        unsigned col = Loc->getColumn();
+                                        numTotalInst++;
+                                        if ((line < profSegLineStart) || (line == profSegLineStart && col < profSegColStart) || (line == profSegLineEnd && col >= profSegColEnd) || (line > profSegLineEnd)) {
+                                            // Update the count if the instruction is in a new segment
+                                            profSegExeCount = getSegExeCount(line, col, segId, profSegLineStart, profSegColStart, profSegLineEnd, profSegColEnd);
+                                        }
+                                        numInstPerSeg[segId] += (numInstWODbg + 1);
+                                        numTotalExeCount += (profSegExeCount * (numInstWODbg + 1));
+                                        numInstWODbg = 0;
+                                        newBB = false;
+                                    } else if (newBB) {
+                                        numTotalInst++;
+                                        numInstWODbg++;
+                                    } else {
+                                        numTotalInst += 1;
+                                        numInstPerSeg[segId] += 1;
+                                        numTotalExeCount += profSegExeCount;
                                     }
-                                    numTotalExeCount += profSegExeCount;
                                 }
                             }
                         }
                         avgExeCountPerInst = numTotalExeCount / numTotalInst;
+                        errs() << "Total static count: " << numTotalInst << ", total dynamic count: " << numTotalExeCount << "\n";
                         return (&*mi);
                     }
                 }
@@ -1281,17 +1370,20 @@ namespace {
                             newCode += "payload = stream_in.read();\n";
                             newCode += (varName + ".set(payload.data.range(" + std::to_string((buf0End+1)*8-1) + ", 0));\n");
                             newCode += ("in_data_buf = payload.data;\nlast_buf = payload.last;\npkt_empty = " + 
-                                std::to_string(buf0End+1) + ";");
+                                std::to_string(buf0End+1) + ";\npkt_data_buf = payload.data.range(" + 
+                                std::to_string(IO_W*8-1) + ", " + std::to_string((buf0End+1)*8) + ");");
                         } else if (buf1End != -1) {
                             newCode += "payload = stream_in.read();\n";
                             newCode += (varName + ".set((payload.data.range(" + std::to_string((buf1End+1)*8-1) + 
                                 ", 0), in_data_buf.range(" + std::to_string((buf0End+1)*8-1) + ", " + std::to_string(buf0Start*8) + ")));\n");
                             newCode += ("in_data_buf = payload.data;\nlast_buf = payload.last;\npkt_empty = " + 
-                                std::to_string(buf1End+1) + ";");
+                                std::to_string(buf1End+1) + ";\npkt_data_buf = payload.data.range(" + std::to_string(IO_W*8-1) +
+                                ", " + std::to_string((buf1End+1)*8) + ");");
                         } else {
                             newCode += (varName + ".set(in_data_buf.range(" + std::to_string((buf0End+1)*8-1) + ", " + 
                                 std::to_string(buf0Start*8) + "));\n");
-                            newCode += ("pkt_empty = " + std::to_string(buf0End+1) + ";");
+                            newCode += ("pkt_empty = " + std::to_string(buf0End+1) + ";\npkt_data_buf = payload.data.range(" + 
+                                std::to_string(IO_W*8-1) + ", " + std::to_string((buf0End+1)*8) + ");");
                         }
 
                         // substitute the input call
@@ -1301,7 +1393,7 @@ namespace {
                         std::size_t index0 = lineBuf.find("top_intf.Input_done");
                         std::size_t index3 = lineBuf.find(";", index0);
                         std::string newCode;
-                        newCode += ("payload.data = in_data_buf.range(511, pkt_empty*8);\n"
+                        newCode += ("payload.data = pkt_data_buf;\n"
                                 "    payload.empty = pkt_empty;\n"
                                 "    payload.last = last_buf;\n"
                                 "    pkt_buf_out.write(payload);\n"
@@ -1505,17 +1597,136 @@ namespace {
                 return program;
             }
 
+            double evalInputFunction(std::ifstream &profile, double th) {
+                profile.seekg(0);
+                double nt = th * avgExeCountPerInst;
+                unsigned long long numStaticInst = 0;
+                unsigned long long numTotalStaticInst = 0;
+                unsigned long long numDynamicInst = 0;
+                unsigned long long numTotalDynamicInst = 0;
+                int line = 1;
+                int col = 1;
+                bool lastRemoved = false;
+                bool done;
+                std::string sourceBuf;
+                getSource(profile, sourceBuf, line, col, profSegments[0][0], profSegments[0][1]+1, "Input_done");
+                col++; // skip the first "{"
+                sourceBuf.clear();
+                for (int i = 0; i < numProfSegments; i++) {
+                    if (profSegments[i][3] == 0) continue;
+                    bool copyEn;
+
+                    int lineStart = line;
+                    int colStart = col;
+                    done = getSource(profile, sourceBuf, line, col, profSegments[i+1][0], profSegments[i+1][1], "Input_done");
+
+                    int numStaticInstSeg = numInstPerSeg[i];
+                    int numDynamicInstSeg = profSegments[i][2] * numStaticInstSeg;
+                    numTotalStaticInst += numStaticInstSeg;
+                    numTotalDynamicInst += numDynamicInstSeg;
+
+                    if (profSegments[i][2] < nt) {
+                        // Remove the segment
+                        if (!lastRemoved) {
+                            // Last segment is not removed
+                            // std::cout << sourceBuf << std::endl;
+                            if (!checkKeep(i, sourceBuf)) {
+                                // Insert early exit statements
+                                // outFile << "cout << \"early exit\\n\";\n";
+                                lastRemoved = true;
+                            } else {
+                                numStaticInst += numStaticInstSeg;
+                                numDynamicInst += numDynamicInstSeg;
+                            }
+                        } else {
+                            lastRemoved = true;
+                        }
+                    } else {
+                        // Keep the segment
+                        numStaticInst += numStaticInstSeg;
+                        numDynamicInst += numDynamicInstSeg;
+                        lastRemoved = false;
+                    }
+
+                    sourceBuf.clear();
+                    if (done) break;
+                }
+
+                double cost = (1.0 - (1.0 - RATE) * double(numDynamicInst) / double(numTotalDynamicInst)) * 
+                        (double(numStaticInst) / double(numTotalStaticInst));
+
+                // errs() << "Static inst covered: " << numStaticInst << " over " << numTotalStaticInst <<
+                //  ", Dynamic inst covered: " << numDynamicInst << " over " << numTotalDynamicInst << ", cost: " << cost << "\n";
+
+                if (numStaticInst == 0) cost = 1000000.0;
+
+                return cost;
+            }
+
+            template<typename generator>
+            double nf(double x, generator& g) {
+                std::normal_distribution<double> d(0, 0.4);
+                double step = d(g);
+                // errs() << "step: " << step << "\n";
+                double res = x + step;
+                if (res < 0.0) {
+                    res = 0.001;
+                }
+                return res;
+            }
+
+            double exploreInputFunction(std::ifstream &profile, const double init_th) {
+                double th_old = init_th;
+                int count = 100;
+                // Simulated annealing algorithm
+                double cost_old = evalInputFunction(profile, th_old);
+                double th_best = th_old;
+                double cost_best = cost_old;
+
+                std::random_device rd;
+                std::mt19937_64 g(rd());
+
+                std::uniform_real_distribution<double> rf(0, 1);
+
+                for (; count > 0; --count) {
+                    double th_new = nf<decltype(g)>(th_old, g);
+                    double cost_new = evalInputFunction(profile, th_new);
+
+                    // errs() << "new th: " << th_new << ", new cost: " << cost_new << ". ";
+
+                    if (cost_new < cost_best) {
+                        th_best = th_new;
+                        cost_best = cost_new;
+                    }
+
+                    if (cost_new < cost_old || std::exp((cost_old - cost_new) / count) > rf(g)) {
+                        // errs() << "move\n";
+                        th_old = th_new;
+                        cost_old = cost_new;
+                    }
+                }
+                errs() << "\n";
+
+                return th_best;
+            }
+
             int extractInputFunction(Function &F, BasicBlock *endBB) {
                 std::ifstream srcFile(filename);
                 std::ofstream outFile("inputSpec.cpp");
-                double threshold = 0.6;
+                // double threshold = 0.5;
+                // double nt = threshold * avgExeCountPerInst;
+
+                double threshold = exploreInputFunction(srcFile, 0.5);
                 double nt = threshold * avgExeCountPerInst;
+                srcFile.seekg(0);
+
                 std::set<BasicBlock*> BBset;
                 std::string program;
 
                 program +=  "void inputUnit::inputUnit_core() {\n"
                             "    primate_stream_512_4::payload_t payload;\n"
                             "    sc_biguint<512> in_data_buf;\n"
+                            "    sc_biguint<512> pkt_data_buf;\n"
                             "    bool last_buf;\n"
                             "    sc_uint<8> pkt_empty;\n";
 
@@ -1543,7 +1754,7 @@ namespace {
                             // Last segment is not removed
                             // std::cout << sourceBuf << std::endl;
                             if (!checkKeep(i, sourceBuf)) {
-                                errs() << "remove\n";
+                                // errs() << "remove\n";
                                 if (checkRegionEntry(i)) {
                                     // Insert left bracket
                                     program += "{\n";
@@ -1555,7 +1766,7 @@ namespace {
                                 lastRemoved = true;
                                 copyEn = false;
                             } else {
-                                errs() << "keep\n";
+                                // errs() << "keep\n";
                                 copyEn = true;
                             }
                         } else {
@@ -1589,7 +1800,42 @@ namespace {
                 program = prologue + program;
 
                 outFile << program;
-                return 0;
+
+                return btID;
+            }
+
+            void generateHeader(int REGWIDTH, int numExit) {
+                std::ofstream outFile("tmp.h");
+                std::string program;
+                for (auto varType = varTypeMap.begin(); varType != varTypeMap.end(); varType++) {
+                    program += "typedef struct {\n";
+                    auto varTypeName = varType->first;
+                    int totalSize = 0;
+                    std::string setFunction;
+                    for (auto field = varType->second->begin(); field != varType->second->end(); field++) {
+                        program += ("    sc_biguint<" + std::to_string(field->second) + "> " + field->first + ";\n");
+                        setFunction += ("        " + field->first + " = bv.range(" + std::to_string(totalSize+(field->second)-1) +
+                        ", " + std::to_string(totalSize) + ");\n");
+                        totalSize += field->second;
+                    }
+                    program += ("    void set(sc_biguint<" + std::to_string(totalSize) + "> bv) {\n");
+                    program += setFunction;
+                    program +=  "    }\n"
+                                "    sc_biguint<REG_WIDTH> to_uint() {\n"
+                                "        sc_biguint<REG_WIDTH> val = (";
+                    if (totalSize < REGWIDTH) {
+                        program += "0, ";
+                    }
+                    std::string tmp;
+                    for (auto field = varType->second->rbegin(); field != varType->second->rend(); field++) {
+                        tmp += (field->first + ", ");
+                    }
+                    program += tmp.substr(0, tmp.length()-2);
+                    program += ");\n        return val;\n    }\n} ";
+                    program += (varTypeName + ";\n\n");
+                }
+                outFile << program;
+                outFile << numExit << "\n";
             }
 
             BasicBlock* getInputDoneBB(Function &F) {
@@ -1706,8 +1952,10 @@ namespace {
                 initializeVarNames(*main_func);
                 BasicBlock *endBB = inferInputFunctions(*main_func);
                 livenessAnalysis(*main_func);
-                extractInputFunction(*main_func, endBB);
+                int numExit = extractInputFunction(*main_func, endBB);
+                generateHeader(192, numExit);
 
+                delete [] numInstPerSeg;
                 for (int i = 0; i < numProfSegments; i++) {
                     delete [] profSegments[i];
                 }
