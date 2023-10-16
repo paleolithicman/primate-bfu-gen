@@ -8,13 +8,14 @@
 # LIB_DIRS=$(SYSTEMC)/lib-$(SYSTEMC_ARCH)
 
 # Include directories
+INCLUDE_DIRS = -I../common
 # INCLUDE_DIRS = -I. -I$(SYSTEMC)/include -I../include
 
 # header files used. for dependency checking
-HEADERS = primate.h common.h bfs.h
+HEADERS = primate.h bfs.h
 
 # source files used. for dependency checking
-SOURCES= common.cpp primate.cpp bfs.cpp main.cpp
+SOURCES= primate.cpp bfs.cpp main.cpp ../common/common.cpp
 
 DEPENDENCIES = \
 	Makefile \

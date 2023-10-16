@@ -89,38 +89,40 @@ void primate_main(primate_io &top_intf) {
     top_intf.Output_meta<standard_metadata_t>(standard_metadata);
     top_intf.Output_header<ethernet_t>(14, eth);
     if (hdr_count < 10) {
-        top_intf.Output_header<ptp_l_t>(20, ptp_l);
-        top_intf.Output_header<ptp_h_t>(24, ptp_h);
+        top_intf.Output_2header<ptp_l_t, ptp_h_t>(20, ptp_l, 24, ptp_h);
         if (hdr_count > 1) {
-            top_intf.Output_header<header_t>(8, header_0);
             if (hdr_count > 2) {
-                top_intf.Output_header<header_t>(8, header_1);
+                top_intf.Output_2header<header_t, header_t>(8, header_0, 8, header_1);
                 if (hdr_count > 3) {
-                    top_intf.Output_header<header_t>(8, header_2);
                     if (hdr_count > 4) {
-                        top_intf.Output_header<header_t>(8, header_3);
+                        top_intf.Output_2header<header_t, header_t>(8, header_2, 8, header_3);
                         if (hdr_count > 5) {
-                            top_intf.Output_header<header_t>(8, header_4);
                             if (hdr_count > 6) {
-                                top_intf.Output_header<header_t>(8, header_5);
+                                top_intf.Output_2header<header_t, header_t>(8, header_4, 8, header_5);
                                 if (hdr_count > 7) {
-                                    top_intf.Output_header<header_t>(8, header_6);
                                     if (hdr_count > 8) {
-                                        top_intf.Output_header<header_t>(8, header_7);
+                                        top_intf.Output_2header<header_t>(8, header_6, 8, header_7);
+                                    } else {
+                                        top_intf.Output_header<header_t>(8, header_6);
                                     }
                                 }
+                            } else {
+                                top_intf.Output_header<header_t>(8, header_4);
                             }
                         }
+                    } else {
+                        top_intf.Output_header<header_t>(8, header_2);
                     }
                 }
+            } else {
+                top_intf.Output_header<header_t>(8, header_0);
             }
         }
     } else {
-        top_intf.Output_header<ipv4_t>(20, ipv4);
         if (hdr_count == 11) {
-            top_intf.Output_header<tcp_t>(20, tcp);
+            top_intf.Output_2header<ipv4_t, tcp_t>(20, ipv4, 20, tcp);
         } else {
-            top_intf.Output_header<udp_t>(8, udp);
+            top_intf.Output_2header<ipv4_t, udp_t>(20, ipv4, 8, udp);
         }
     }
     top_intf.Output_done();

@@ -1,7 +1,7 @@
 #ifndef _PRIMATE_
 #define _PRIMATE_
 
-#include "common.h"
+#include "../common/common.h"
 
 #define NUM_THREADS 16
 #define NUM_THREADS_LG 4

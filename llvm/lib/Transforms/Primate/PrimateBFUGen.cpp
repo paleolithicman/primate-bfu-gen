@@ -20,7 +20,6 @@ Boundary Conditions: empty set for flow value. identified by no successors.
  *********************************************************************************/
 
 #include<llvm/Pass.h>
-#include<llvm/IR/DebugInfo.h>
 #include<llvm/IR/Function.h>
 #include<llvm/IR/Module.h>
 #include<llvm/IR/Metadata.h>
@@ -36,33 +35,15 @@ Boundary Conditions: empty set for flow value. identified by no successors.
 #include<llvm/IR/LegacyPassManager.h>
 #include<llvm/Transforms/IPO/PassManagerBuilder.h>
 
-#include "rapidjson/document.h"
 #include "dataflow.h"
-
-#include <ostream>
-#include <fstream>
-#include <iostream>
-#include <iomanip>
-#include <sstream>
-#include <stdlib.h>
-#include <algorithm>
-#include <random>
-#include <math.h>
-#include <map>
-#include <tuple>
-#include <string>
-
-#define MAX_BR_LEVEL 2
-#define MAX_PERF 0
-#define BALANCE 1
-#define IO_W 64
-#define RATE (0.05)
+#include "inputGen.h"
+#include "outputGen.h"
 
 using namespace llvm;
 
 namespace {
 
-    class PrimateBFUGen : public ModulePass, public DataFlow<BitVector>, public AssemblyAnnotationWriter{
+    class PrimateBFUGen : public ModulePass, public DataFlow<BitVector>, public inputGen, public outputGen, public AssemblyAnnotationWriter{
 
         public:
             static char ID;
@@ -82,39 +63,12 @@ namespace {
                 ptrInfo_t(Value *base = NULL, int offset = 0) : base(base), offset(offset) {}
             };
 
-            // domain vector to store all definitions and function arguments
-            std::string filename;
-            unsigned long long numTotalInst;
-            unsigned long long numTotalExeCount;
-            int numProfSegments;
-            int **profSegments;
-            int numProfRegions;
-            int **profRegions;
-            int numProfBranches;
-            int **profBranches;
-            int *numInstPerSeg;
-            double avgExeCountPerInst;
-            int numInst;
-            int numLine;
-            int inputDoneLine;
-            std::map<int, std::map<int, Value*>*> lineToBBs;
-            ValueMap<Value*, std::string> varNameMap;
-            ValueMap<Value*, int> varRegMap;
-            std::map<std::string, std::vector<std::pair<std::string, int>>*> varTypeMap;
-
-            // tuple: start index; end index; end index of the second flit if the header spans across two flits, default -1
-            ValueMap<Value*, std::tuple<int, int, int>> inputInstRange;
-            // TODO: line, col, Inst_ptr; assume each line has only one Input_header
-            std::map<int, std::pair<int, Value*>> inputInstLoc;
-
             std::vector<Value*> domain;
             std::vector<Value*> *bvIndexToInstrArg;                 //map values to their bitvector
             ValueMap<Value*, int> *valueToBitVectorIndex;           //map values (args and variables) to their bit vector index
             ValueMap<const Instruction*, BitVector*> *instrInSet;     //IN set for an instruction inside basic block
             ValueMap<Value*, Value*> *aliasMap;
             ValueMap<Value*, int> *branchLevel;
-            std::vector<unsigned> *gatherModes;
-            std::map<unsigned, std::vector<unsigned>*> *fieldIndex;
             ValueMap<Value*, ptrInfo_t*> *pointerMap;
             ValueMap<Value*, std::map<Value*, bool>*> dependencyForest;
             ValueMap<Value*, std::map<Value*, bool>*> dependencyForestOp;
@@ -286,13 +240,6 @@ namespace {
                 return immIn;
             }
 
-            void printBasicBlock(BasicBlock &B) {
-                for (auto inst_it = B.begin(); inst_it != B.end(); inst_it++) {
-                    inst_it->print(errs());
-                    errs() << "\n";
-                }
-            }
-
             bool isLifetimeCall(Instruction *ii) {
                 bool res = false;
                 if (isa<CallInst>(*ii)) {
@@ -364,20 +311,9 @@ namespace {
                 unsigned elemWidth = 0;
                 if (isa<llvm::IntegerType>(*elem)) {
                     elemWidth = elem->getIntegerBitWidth();
-                    // insert new gather mode if doesn't exist
-                    if (std::find(gatherModes->begin(), gatherModes->end(), elemWidth) == gatherModes->end()) {
-                        gatherModes->push_back(elemWidth);
-                    }
                 }
                 for (int i = 0; i < a.getNumElements(); i++) {
-                    if (fieldIndex->find(width) == fieldIndex->end()) {
-                        (*fieldIndex)[width] = new std::vector<unsigned>();
-                    }
                     if (isa<llvm::IntegerType>(*elem)) {
-                        // the width of all numbers possibly stored at each index
-                        if (std::find((*fieldIndex)[width]->begin(), (*fieldIndex)[width]->end(), elemWidth) == (*fieldIndex)[width]->end()) {
-                            (*fieldIndex)[width]->push_back(elemWidth);
-                        }
                         width += elemWidth;
                     } else if (isa<llvm::ArrayType>(*elem)) {
                         auto *selem = dyn_cast<llvm::ArrayType>(elem);
@@ -395,23 +331,8 @@ namespace {
             unsigned getStructWidth(StructType &s, unsigned start, const bool arcGen) {
                 unsigned width = start;
                 for (auto elem = s.element_begin(); elem != s.element_end(); elem++) {
-                    if (arcGen) {
-                        if (fieldIndex->find(width) == fieldIndex->end()) {
-                            (*fieldIndex)[width] = new std::vector<unsigned>();
-                        }
-                    }
                     if (isa<llvm::IntegerType>(**elem)) {
                         unsigned elemWidth = (*elem)->getIntegerBitWidth();
-                        if (arcGen) {
-                            // insert new gather mode if doesn't exist
-                            if (std::find(gatherModes->begin(), gatherModes->end(), elemWidth) == gatherModes->end()) {
-                                gatherModes->push_back(elemWidth);
-                            }
-                            // the width of all numbers possibly stored at each index
-                            if (std::find((*fieldIndex)[width]->begin(), (*fieldIndex)[width]->end(), elemWidth) == (*fieldIndex)[width]->end()) {
-                                (*fieldIndex)[width]->push_back(elemWidth);
-                            }
-                        }
                         width += elemWidth;
                     } else if (isa<llvm::ArrayType>(**elem)) {
                         auto *selem = dyn_cast<llvm::ArrayType>(*elem);
@@ -423,11 +344,6 @@ namespace {
                         auto *selem = dyn_cast<llvm::StructType>(*elem);
                         unsigned elemWidth = getStructWidth((*selem), width, arcGen);
                         width = elemWidth;
-                    }
-                }
-                if (arcGen) {
-                    if (fieldIndex->find(width) == fieldIndex->end()) {
-                        (*fieldIndex)[width] = new std::vector<unsigned>();
                     }
                 }
                 return width;
@@ -967,79 +883,6 @@ namespace {
                 }
             }
 
-            void initializeVarNameMap(Function &F) {
-                int i = 1;
-                for (inst_iterator inst_it = inst_begin(F), e = inst_end(F); inst_it != e; ++inst_it) {
-                    if (isa<DbgDeclareInst>(*inst_it)) {
-                        auto* dbgInst = dyn_cast<DbgDeclareInst>(&*inst_it);
-                        auto* instMeta = cast<MetadataAsValue>(dbgInst->getOperand(0))->getMetadata();
-                        Value* inst = cast<ValueAsMetadata>(instMeta)->getValue();
-                        auto *varMeta = cast<DILocalVariable>(cast<MetadataAsValue>(dbgInst->getOperand(1))->getMetadata());
-                        std::string name = (varMeta->getName()).str();
-                        varNameMap[inst] = name;
-                        // errs() << "name: " << name << "\n";
-                        std::vector<int> fieldWidth;
-                        if (isa<AllocaInst>(*inst)) {
-                            auto* aInst = dyn_cast<AllocaInst>(inst);
-                            Type *aType = aInst->getAllocatedType();
-                            if (isa<StructType>(*aType)) {
-                                auto stype = dyn_cast<StructType>(aType);
-                                for (auto elem = stype->element_begin(); elem != stype->element_end(); elem++) {
-                                    if (isa<IntegerType>(**elem)) {
-                                        unsigned elemWidth = (*elem)->getIntegerBitWidth();
-                                        fieldWidth.emplace_back(elemWidth);
-                                    } else {
-                                        errs() << "Each field must be integer type\n";
-                                        exit(1);
-                                    }
-                                }
-                            }
-                        }
-                        if (name != "top_intf") {
-                            varRegMap[inst] = i;
-                            i++;
-
-                            // record the types
-                            DIType* varType = varMeta->getType();
-                            DICompositeType* varBaseType;
-                            std::string varTypeName;
-                            if (isa<DIDerivedType>(*varType)) {
-                                varTypeName = ((cast<DIDerivedType>(varType))->getName()).str();
-                                auto *tmp = (cast<DIDerivedType>(varType))->getBaseType();
-                                if (isa<DICompositeType>(*tmp)) {
-                                    varBaseType = cast<DICompositeType>(tmp);
-                                } else {
-                                    continue;
-                                }
-                            } else if (isa<DICompositeType>(*varType)) {
-                                varBaseType = cast<DICompositeType>(varType);
-                                varTypeName = (varBaseType->getName()).str();
-                            } else {
-                                continue;
-                            }
-                            if (varTypeMap.find(varTypeName) == varTypeMap.end()) {
-                                if (varBaseType->getTag() == 0x0013) {  // The ID of DW_TAG_structure_type
-                                    varTypeMap[varTypeName] = new std::vector<std::pair<std::string, int>>();
-                                    DINodeArray fieldArray = varBaseType->getElements();
-                                    int j = 0;
-                                    for (auto field_it = fieldArray.begin(); field_it != fieldArray.end(); field_it++) {
-                                        if (isa<DIDerivedType>(**field_it)) {
-                                            DIDerivedType* field = cast<DIDerivedType>(*field_it);
-                                            if (field->getTag() == 0x000d) { // The ID of DW_TAG_member
-                                                auto fieldName = field->getName();
-                                                varTypeMap[varTypeName]->emplace_back(std::make_pair(fieldName, fieldWidth[j]));
-                                                j++;
-                                                // errs() << "Type: " << varTypeName << ", Field: " << fieldName << ", Size: " << field->getSizeInBits() << "\n";
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             void initializeVarNames(Function &F) {
                 InitializePointerMap(F);
                 buildDependencyForest(F);
@@ -1086,7 +929,7 @@ namespace {
                 return false;
             }
 
-            BitVector* getLiveoutVariables(std::set<BasicBlock*> &BBset, BasicBlock &endBB) {
+            virtual BitVector* getLiveoutVariables(std::set<BasicBlock*> &BBset, BasicBlock &endBB) {
                 BitVector* updated = new BitVector(domainSize, false);
                 for (auto bb_it = BBset.begin(); bb_it != BBset.end(); bb_it++) {
                     for (auto inst_it = (*bb_it)->begin(); inst_it != (*bb_it)->end(); inst_it++) {
@@ -1118,305 +961,53 @@ namespace {
                 return updated;
             }
 
-            void initializeBBLoc(Function &F) {
-                for (auto bb_it = F.begin(); bb_it != F.end(); bb_it++) {
-                    for (auto inst_it = bb_it->begin(); inst_it != bb_it->end(); inst_it++) {
-                        Instruction *inst = dyn_cast<Instruction>(&*inst_it);
-                        if (DILocation *Loc = inst->getDebugLoc()) {
-                            unsigned line = Loc->getLine();
-                            unsigned col = Loc->getColumn();
-                            if (lineToBBs.find(line) != lineToBBs.end()) {
-                                bool found = false;
-                                for (auto it = lineToBBs[line]->begin(); it != lineToBBs[line]->end(); it++) {
-                                    if (it->second == &*bb_it) {
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                                if (!found) {
-                                    (*lineToBBs[line])[col] = &*bb_it;
-                                }
-                            } else {
-                                lineToBBs[line] = new std::map<int, Value*>();
-                                (*lineToBBs[line])[col] = &*bb_it;
+            virtual BitVector* getLiveinVariables(std::set<BasicBlock*> &BBset) {
+                BitVector* referred = new BitVector(domainSize, false);
+                for (auto bb_it = BBset.begin(); bb_it != BBset.end(); bb_it++) {
+                    BitVector *liveins = (*in)[*bb_it];
+                    BitVector *liveouts = (*out)[*bb_it];
+                    (*liveins) &= ((*liveouts).flip());
+                    (*referred) |= (*liveins);
+                }
+                return referred;
+            }
+
+            virtual void initializeLiveinVars(BitVector* referred) {
+                for (int i=0; i < referred->size(); i++) {
+                    if ( (*referred)[i] ) {
+                        Value *var = (*bvIndexToInstrArg)[i];
+                        bool isInt = false;
+                        int width = 0;
+                        if (isa<AllocaInst>(*var)) {
+                            auto *inst = dyn_cast<AllocaInst>(var);
+                            Type *varType = inst->getAllocatedType();
+                            if (isa<IntegerType>(*varType)) {
+                                isInt = true;
+                                auto* varIntType = dyn_cast<IntegerType>(varType);
+                                width = varIntType->getBitWidth();
+                            }
+                        }
+                        if (varNameMap.find(var) != varNameMap.end()) {
+                            std::string name = varNameMap[var];
+                            if (isInt) {
+                                liveinVars.insert(std::make_pair(name, width));
                             }
                         }
                     }
                 }
             }
 
-            BasicBlock* getBBfromLoc(int lineStart, int colStart, int lineEnd, int colEnd) {
-                if (lineToBBs.find(lineStart) != lineToBBs.end()) {
-                    for (auto it = lineToBBs[lineStart]->begin(); it != lineToBBs[lineStart]->end(); it++) {
-                        if (it->first >= colStart) {
-                            return dyn_cast<BasicBlock>(it->second);
-                        }
-                    }
+            virtual int getRegIdx(Value* var) {
+                Value *rootVar = (*aliasMap)[var];
+                if (varRegMap.find(rootVar) != varRegMap.end()) {
+                    return varRegMap[rootVar];
+                } else {
+                    errs() << "Error: Can't get the register index of the variable.\n";
+                    return 0;
                 }
-                for (int line = lineStart+1; line < lineEnd; line++) {
-                    if (lineToBBs.find(line) != lineToBBs.end()) {
-                        for (auto it = lineToBBs[line]->begin(); it != lineToBBs[line]->end(); it++) {
-                            return dyn_cast<BasicBlock>(it->second);
-                        }
-                    }
-                }
-                if (lineToBBs.find(lineEnd) != lineToBBs.end()) {
-                    for (auto it = lineToBBs[lineEnd]->begin(); it != lineToBBs[lineEnd]->end(); it++) {
-                        if (it->first < colEnd) {
-                            return dyn_cast<BasicBlock>(it->second);
-                        }
-                    }
-                }
-                return NULL;
             }
 
-            int initializeProfData() {
-                std::ifstream file("prof.json");
-                std::string json((std::istreambuf_iterator<char>(file)),
-                            std::istreambuf_iterator<char>());
-
-                rapidjson::Document doc;
-                doc.Parse(json.c_str());
-             
-                if (doc.HasParseError()) {
-                    std::cerr << "Error parsing JSON: "
-                         << doc.GetParseError() << std::endl;
-                    return 1;
-                }
-
-                // parse branch regions
-                const rapidjson::Value &branches = doc["data"][0]["files"][0]["branches"];
-                numProfBranches = branches.Size();
-                profBranches = new int*[numProfBranches];
-                for (int i = 0; i < numProfBranches; i++) {
-                    profBranches[i] = new int[9];
-                    for (int j = 0; j < 9; j++) {
-                        profBranches[i][j] = branches[i][j].GetInt();
-                    }
-                }
-
-                // parse segments
-                filename = doc["data"][0]["files"][0]["filename"].GetString();
-                const rapidjson::Value &segments = doc["data"][0]["files"][0]["segments"];
-
-                numProfSegments = segments.Size();
-                profSegments = new int*[numProfSegments];
-                for (int i = 0; i < numProfSegments; i++) {
-                    profSegments[i] = new int[6];
-                    for (int j = 0; j < 3; j++) {
-                        profSegments[i][j] = segments[i][j].GetInt();
-                    }
-                    for (int j = 3; j < 6; j++) {
-                        profSegments[i][j] = segments[i][j].GetBool();
-                    }
-                }
-                numLine = segments[numProfSegments-1][0].GetInt();
-
-                // parse regions
-                const rapidjson::Value &functions = doc["data"][0]["functions"];
-                for (rapidjson::Value::ConstValueIterator function_it = functions.Begin(); function_it != functions.End(); function_it++) {
-                    std::string func_name = (*function_it)["name"].GetString();
-                    if (func_name.find("primate_main") != std::string::npos) {
-                        const rapidjson::Value &regions = (*function_it)["regions"];
-                        numProfRegions = regions.Size();
-                        profRegions = new int*[numProfRegions];
-                        for (int i = 0; i < numProfRegions; i++) {
-                            profRegions[i] = new int[8];
-                            for (int j = 0; j < 8; j++) {
-                                profRegions[i][j] = regions[i][j].GetInt();
-                            }
-                        }
-                        break;
-                    }
-                }
-
-                return 0;
-            }
-
-            int getSegExeCount(const unsigned line, const unsigned col, int &segId, int &segLineStart, int &segColStart, int &segLineEnd, int &segColEnd) {
-                int segExeCount = 0;
-                for (int i = 0; i < numProfSegments; i++) {
-                    if (profSegments[i][3] == 0) {
-                        // skip this entry if it has no count
-                        continue;
-                    }
-                    segLineStart = profSegments[i][0];
-                    segColStart = profSegments[i][1];
-                    if ((line < segLineStart) || (line == segLineStart && col < segColStart)) {
-                        continue;
-                    } else if (i+1 < numProfSegments) {
-                        if (line > profSegments[i+1][0] || (line == profSegments[i+1][0] && col >= profSegments[i+1][1])) {
-                            continue;
-                        }
-                    }
-
-                    segExeCount = profSegments[i][2];
-                    segId = i;
-                    for (int j = i+1; j < numProfSegments; j++) {
-                        if (profSegments[j][3] == 0) {
-                            // skip this entry if it has no count
-                            continue;
-                        }
-                        segLineEnd = profSegments[j][0];
-                        segColEnd = profSegments[j][1];
-                        break;
-                    }
-                    break;
-                }
-                return segExeCount;
-            }
-
-            Function* initializeExeCount(Module &M) {
-                numInstPerSeg = new int[numProfSegments];
-                for (int i = 0; i < numProfSegments; i++) {
-                    numInstPerSeg[i] = 0;
-                }
-                for (Module::iterator mi = M.begin(); mi != M.end(); mi++) {
-                    if ((mi->getName()).find("primate_main") != StringRef::npos) {
-                        numTotalInst = 0;
-                        numTotalExeCount = 0;
-                        int profSegExeCount;
-                        int profSegLineStart = 0;
-                        int profSegColStart = 0;
-                        int profSegLineEnd = 0;
-                        int profSegColEnd = 0;
-                        int segId = 0;
-                        for (Function::iterator bi = mi->begin(); bi != mi->end(); bi++) {
-                            BasicBlock *bb = &*bi;
-                            bool newBB = true;
-                            int numInstWODbg = 0;
-                            for (auto ii = bb->begin(); ii != bb->end(); ++ii) {
-                                Instruction *inst = dyn_cast<Instruction>(&*ii);
-                                if (!(isa<CallInst>(*inst) || isa<AllocaInst>(*inst) || isa<PHINode>(*inst))) {
-                                    if (DILocation *Loc = inst->getDebugLoc()) {
-                                        unsigned line = Loc->getLine();
-                                        unsigned col = Loc->getColumn();
-                                        numTotalInst++;
-                                        if ((line < profSegLineStart) || (line == profSegLineStart && col < profSegColStart) || (line == profSegLineEnd && col >= profSegColEnd) || (line > profSegLineEnd)) {
-                                            // Update the count if the instruction is in a new segment
-                                            profSegExeCount = getSegExeCount(line, col, segId, profSegLineStart, profSegColStart, profSegLineEnd, profSegColEnd);
-                                        }
-                                        numInstPerSeg[segId] += (numInstWODbg + 1);
-                                        numTotalExeCount += (profSegExeCount * (numInstWODbg + 1));
-                                        numInstWODbg = 0;
-                                        newBB = false;
-                                    } else if (newBB) {
-                                        numTotalInst++;
-                                        numInstWODbg++;
-                                    } else {
-                                        numTotalInst += 1;
-                                        numInstPerSeg[segId] += 1;
-                                        numTotalExeCount += profSegExeCount;
-                                    }
-                                }
-                            }
-                        }
-                        avgExeCountPerInst = numTotalExeCount / numTotalInst;
-                        errs() << "Total static count: " << numTotalInst << ", total dynamic count: " << numTotalExeCount << "\n";
-                        return (&*mi);
-                    }
-                }
-                return NULL;
-            }
-
-            bool getSource(std::ifstream &inFile, std::string &sourceBuf, int &line, int &col, const int lineEnd, const int colEnd, std::string pattern) {
-                // Return true if the pattern is found
-                char c;
-
-                while ((line < lineEnd) || (line == lineEnd && col < colEnd)) {
-                    inFile.get(c);
-                    if (c == '\n') {
-                        line++;
-                        col = 1;
-                    } else {
-                        col++;
-                    }
-                    sourceBuf += c;
-                }
-
-                if (sourceBuf.find(pattern) != std::string::npos) {
-                    return true;
-                }
-
-                return false;
-            }
-
-            std::string translateSource(std::string source, int lineStart, int colStart) {
-                std::string program;
-                int line = lineStart;
-                int col = colStart;
-                std::istringstream iss(source);
-                std::string lineBuf;
-                while (std::getline(iss, lineBuf)) {
-                    auto inputInstMeta = inputInstLoc.find(line);
-                    if (inputInstMeta != inputInstLoc.end()) {
-                        Instruction *inst = dyn_cast<Instruction>((inputInstMeta->second).second);
-                        // inst->print(errs());
-                        // errs() << "\n";
-                        // find input call location and get variable name
-                        std::size_t index0 = lineBuf.find("top_intf.Input_header");
-                        std::size_t index1 = lineBuf.find(",", index0);
-                        std::size_t index2 = lineBuf.find(")", index0);
-                        std::size_t index3 = lineBuf.find(";", index0);
-                        std::string varName = lineBuf.substr(index1+1, index2-index1-1);
-                        varName.erase(std::remove_if(varName.begin(), varName.end(), ::isspace), varName.end());
-                        // construct substitution
-                        std::string newCode;
-                        auto instRange = inputInstRange[inst];
-                        int buf0Start = std::get<0>(instRange);
-                        int buf0End = std::get<1>(instRange);
-                        int buf1End = std::get<2>(instRange);
-                        if (buf0Start == 0) {
-                            newCode += "payload = stream_in.read();\n";
-                            newCode += (varName + ".set(payload.data.range(" + std::to_string((buf0End+1)*8-1) + ", 0));\n");
-                            newCode += ("in_data_buf = payload.data;\nlast_buf = payload.last;\npkt_empty = " + 
-                                std::to_string(buf0End+1) + ";\npkt_data_buf = payload.data.range(" + 
-                                std::to_string(IO_W*8-1) + ", " + std::to_string((buf0End+1)*8) + ");");
-                        } else if (buf1End != -1) {
-                            newCode += "payload = stream_in.read();\n";
-                            newCode += (varName + ".set((payload.data.range(" + std::to_string((buf1End+1)*8-1) + 
-                                ", 0), in_data_buf.range(" + std::to_string((buf0End+1)*8-1) + ", " + std::to_string(buf0Start*8) + ")));\n");
-                            newCode += ("in_data_buf = payload.data;\nlast_buf = payload.last;\npkt_empty = " + 
-                                std::to_string(buf1End+1) + ";\npkt_data_buf = payload.data.range(" + std::to_string(IO_W*8-1) +
-                                ", " + std::to_string((buf1End+1)*8) + ");");
-                        } else {
-                            newCode += (varName + ".set(in_data_buf.range(" + std::to_string((buf0End+1)*8-1) + ", " + 
-                                std::to_string(buf0Start*8) + "));\n");
-                            newCode += ("pkt_empty = " + std::to_string(buf0End+1) + ";\npkt_data_buf = payload.data.range(" + 
-                                std::to_string(IO_W*8-1) + ", " + std::to_string((buf0End+1)*8) + ");");
-                        }
-
-                        // substitute the input call
-                        lineBuf.replace(index0, index3-index0+1, newCode);
-                        line++;
-                    } else if (line == inputDoneLine) {
-                        std::size_t index0 = lineBuf.find("top_intf.Input_done");
-                        std::size_t index3 = lineBuf.find(";", index0);
-                        std::string newCode;
-                        newCode += ("payload.data = pkt_data_buf;\n"
-                                "    payload.empty = pkt_empty;\n"
-                                "    payload.last = last_buf;\n"
-                                "    pkt_buf_out.write(payload);\n"
-                                "    while (!last_buf) {\n"
-                                "        payload = stream_in.read();\n"
-                                "        last_buf = payload.last;\n"
-                                "        pkt_buf_out.write(payload);\n"
-                                "    }");
-                        lineBuf.replace(index0, index3-index0+1, newCode);
-                        line++;
-                    } else {
-                        line++;
-                    }
-                    program += lineBuf;
-                    if (!iss.eof()) {
-                        program += "\n";
-                    }
-                }
-
-                return program;
-            }
-
-            std::string insertExit(std::set<BasicBlock*> &BBset, BasicBlock* startBB, BasicBlock* endBB, BasicBlock* doneBB, int btID) {
+            virtual std::string insertInputExit(std::set<BasicBlock*> &BBset, BasicBlock* startBB, BasicBlock* endBB, BasicBlock* doneBB, int btID) {
                 std::set<BasicBlock*> intersect;
                 std::set<BasicBlock*> reachable;
                 std::vector<BasicBlock*> workstack;
@@ -1497,477 +1088,27 @@ namespace {
                 
                 return exitCode;
             }
-
-            bool checkRegionEntry(int segId) {
-                if (profSegments[segId][4] != 0) {
-                    return true;
-                } else if (segId > 0 && (profSegments[segId-1][0] == profSegments[segId][0]) 
-                    && (profSegments[segId-1][1] == profSegments[segId][1]) && (profSegments[segId-1][4] != 0)) {
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-
-            bool checkRegionExit(int segId) {
-                // TODO: searching algorithm can be optimized
-                int lineStart = profSegments[segId][0];
-                int colStart = profSegments[segId][1];
-                for (int i = 0; i < numProfRegions; i++) {
-                    // skip gap region since they are always kept
-                    if ((profRegions[i][7] != 3) && (lineStart == profRegions[i][2]) && (colStart == profRegions[i][3])) {
-                        return true;
-                    } else if (profRegions[i][0] > lineStart) {
-                        return false;
-                    }
-                }
-                return false;
-            }
-
-            bool checkBranchRegion(int segId) {
-                // TODO: searching algorithm can be optimized
-                int lineStart = profSegments[segId][0];
-                int colStart = profSegments[segId][1];
-                for (int i = 0; i < numProfBranches; i++) {
-                    if (lineStart >= profBranches[i][0] && lineStart <= profBranches[i][2]) {
-                        if (lineStart == profBranches[i][0] && colStart < profBranches[i][1]) {
-                            continue;
-                        } else if (lineStart == profBranches[i][2] && colStart > profBranches[i][3]) {
-                            continue;
-                        } else {
-                            return true;
-                        }
-                    } else if (lineStart < profBranches[i][0]) {
-                        return false;
-                    }
-                }
-                return false;
-            }
-
-            bool checkKeep(int segId, std::string sourceBuf) {
-                if (profSegments[segId][5] != 0) {
-                    // gap region
-                    return true;
-                } else if (sourceBuf.find("if ") == 0) {
-                    // starting with "if"
-                    return true;
-                } else if (checkBranchRegion(segId)) {
-                    // within a branch region or following a branch region
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-
-            std::string generateInputMain(int numExit) {
-                std::string program =   "#include \"inputUnit.h\"\n"
-                                        "void inputUnit::inputUnit_main() {\n"
-                                        "    primate_ctrl_iu::cmd_t cmd;\n\n"
-                                        "    stream_in.reset();\n"
-                                        "    cmd_in.reset();\n"
-                                        "    pkt_buf_out.reset();\n"
-                                        "    bfu_out.reset();\n";
-    
-                for (int i = 0; i < numExit; i++) {
-                    program += ("    bt" + std::to_string(i) + " = 0;\n");
-                }
-
-                program +=  "    wait();\n"
-                            "    while (true) {\n"
-                            "        cmd = cmd_in.read();\n"
-                            "        tag = cmd.ar_tag;\n"
-                            "        opcode = cmd.ar_opcode;\n"
-                            "        if (opcode == 0x3f) {\n"
-                            "            if (cmd.ar_imm == 0) {\n"
-                            "                bt0 = cmd.ar_bits;\n";
-
-                for (int i = 1; i < numExit; i++) {
-                    program += ("            } else if (cmd.ar_imm == " + std::to_string(i) + ") {\n"
-                                "                bt" + std::to_string(i) + " = cmd.ar_bits;\n");
-                }
-
-                program +=  "            }\n"
-                            "            wait();\n"
-                            "        } else {\n"
-                            "            inputUnit_core();\n"
-                            "        }\n"
-                            "    }\n"
-                            "}\n\n";
-
-                return program;
-            }
-
-            double evalInputFunction(std::ifstream &profile, double th) {
-                profile.seekg(0);
-                double nt = th * avgExeCountPerInst;
-                unsigned long long numStaticInst = 0;
-                unsigned long long numTotalStaticInst = 0;
-                unsigned long long numDynamicInst = 0;
-                unsigned long long numTotalDynamicInst = 0;
-                int line = 1;
-                int col = 1;
-                bool lastRemoved = false;
-                bool done;
-                std::string sourceBuf;
-                getSource(profile, sourceBuf, line, col, profSegments[0][0], profSegments[0][1]+1, "Input_done");
-                col++; // skip the first "{"
-                sourceBuf.clear();
-                for (int i = 0; i < numProfSegments; i++) {
-                    if (profSegments[i][3] == 0) continue;
-                    bool copyEn;
-
-                    int lineStart = line;
-                    int colStart = col;
-                    done = getSource(profile, sourceBuf, line, col, profSegments[i+1][0], profSegments[i+1][1], "Input_done");
-
-                    int numStaticInstSeg = numInstPerSeg[i];
-                    int numDynamicInstSeg = profSegments[i][2] * numStaticInstSeg;
-                    numTotalStaticInst += numStaticInstSeg;
-                    numTotalDynamicInst += numDynamicInstSeg;
-
-                    if (profSegments[i][2] < nt) {
-                        // Remove the segment
-                        if (!lastRemoved) {
-                            // Last segment is not removed
-                            // std::cout << sourceBuf << std::endl;
-                            if (!checkKeep(i, sourceBuf)) {
-                                // Insert early exit statements
-                                // outFile << "cout << \"early exit\\n\";\n";
-                                lastRemoved = true;
-                            } else {
-                                numStaticInst += numStaticInstSeg;
-                                numDynamicInst += numDynamicInstSeg;
-                            }
-                        } else {
-                            lastRemoved = true;
-                        }
-                    } else {
-                        // Keep the segment
-                        numStaticInst += numStaticInstSeg;
-                        numDynamicInst += numDynamicInstSeg;
-                        lastRemoved = false;
-                    }
-
-                    sourceBuf.clear();
-                    if (done) break;
-                }
-
-                double cost = (1.0 - (1.0 - RATE) * double(numDynamicInst) / double(numTotalDynamicInst)) * 
-                        (double(numStaticInst) / double(numTotalStaticInst));
-
-                // errs() << "Static inst covered: " << numStaticInst << " over " << numTotalStaticInst <<
-                //  ", Dynamic inst covered: " << numDynamicInst << " over " << numTotalDynamicInst << ", cost: " << cost << "\n";
-
-                if (numStaticInst == 0) cost = 1000000.0;
-
-                return cost;
-            }
-
-            template<typename generator>
-            double nf(double x, generator& g) {
-                std::normal_distribution<double> d(0, 0.4);
-                double step = d(g);
-                // errs() << "step: " << step << "\n";
-                double res = x + step;
-                if (res < 0.0) {
-                    res = 0.001;
-                }
-                return res;
-            }
-
-            double exploreInputFunction(std::ifstream &profile, const double init_th) {
-                double th_old = init_th;
-                int count = 100;
-                // Simulated annealing algorithm
-                double cost_old = evalInputFunction(profile, th_old);
-                double th_best = th_old;
-                double cost_best = cost_old;
-
-                std::random_device rd;
-                std::mt19937_64 g(rd());
-
-                std::uniform_real_distribution<double> rf(0, 1);
-
-                for (; count > 0; --count) {
-                    double th_new = nf<decltype(g)>(th_old, g);
-                    double cost_new = evalInputFunction(profile, th_new);
-
-                    // errs() << "new th: " << th_new << ", new cost: " << cost_new << ". ";
-
-                    if (cost_new < cost_best) {
-                        th_best = th_new;
-                        cost_best = cost_new;
-                    }
-
-                    if (cost_new < cost_old || std::exp((cost_old - cost_new) / count) > rf(g)) {
-                        // errs() << "move\n";
-                        th_old = th_new;
-                        cost_old = cost_new;
-                    }
-                }
-                errs() << "\n";
-
-                return th_best;
-            }
-
-            int extractInputFunction(Function &F, BasicBlock *endBB) {
-                std::ifstream srcFile(filename);
-                std::ofstream outFile("inputSpec.cpp");
-                // double threshold = 0.5;
-                // double nt = threshold * avgExeCountPerInst;
-
-                double threshold = exploreInputFunction(srcFile, 0.5);
-                double nt = threshold * avgExeCountPerInst;
-                srcFile.seekg(0);
-
-                std::set<BasicBlock*> BBset;
-                std::string program;
-
-                program +=  "void inputUnit::inputUnit_core() {\n"
-                            "    primate_stream_512_4::payload_t payload;\n"
-                            "    sc_biguint<512> in_data_buf;\n"
-                            "    sc_biguint<512> pkt_data_buf;\n"
-                            "    bool last_buf;\n"
-                            "    sc_uint<8> pkt_empty;\n";
-
-                int line = 1;
-                int col = 1;
-                int btID = 1;
-                bool lastRemoved = false;
-                bool done;
-                std::string sourceBuf;
-                getSource(srcFile, sourceBuf, line, col, profSegments[0][0], profSegments[0][1]+1, "Input_done");
-                col++; // skip the first "{"
-                sourceBuf.clear();
-                for (int i = 0; i < numProfSegments; i++) {
-                    if (profSegments[i][3] == 0) continue;
-                    bool copyEn;
-
-                    int lineStart = line;
-                    int colStart = col;
-                    done = getSource(srcFile, sourceBuf, line, col, profSegments[i+1][0], profSegments[i+1][1], "Input_done");
-                    BasicBlock* BB = getBBfromLoc(profSegments[i][0], profSegments[i][1], profSegments[i+1][0], profSegments[i+1][1]);
-
-                    if (profSegments[i][2] < nt) {
-                        // Remove the segment
-                        if (!lastRemoved) {
-                            // Last segment is not removed
-                            // std::cout << sourceBuf << std::endl;
-                            if (!checkKeep(i, sourceBuf)) {
-                                // errs() << "remove\n";
-                                if (checkRegionEntry(i)) {
-                                    // Insert left bracket
-                                    program += "{\n";
-                                }
-                                // Insert early exit statements
-                                // outFile << "cout << \"early exit\\n\";\n";
-                                program += insertExit(BBset, &(F.getEntryBlock()), BB, endBB, btID);
-                                btID++;
-                                lastRemoved = true;
-                                copyEn = false;
-                            } else {
-                                // errs() << "keep\n";
-                                copyEn = true;
-                            }
-                        } else {
-                            lastRemoved = true;
-                            copyEn = false;
-                        }
-                    } else {
-                        // Keep the segment
-                        if (BB != NULL) BBset.insert(BB);
-                        if (lastRemoved) {
-                            // Last segment is removed
-                            if (checkRegionExit(i)) {
-                                // Insert right bracket
-                                program += "}\n";
-                            }
-                        }
-                        lastRemoved = false;
-                        copyEn = true;
-                    }
-
-                    if (copyEn)
-                        program += translateSource(sourceBuf, lineStart, colStart);
-                    sourceBuf.clear();
-                    if (done) break;
-                }
-                program += insertExit(BBset, &(F.getEntryBlock()), endBB, endBB, 0);
-
-                program += "}\n";
-
-                std::string prologue = generateInputMain(btID);
-                program = prologue + program;
-
-                outFile << program;
-
-                return btID;
-            }
-
-            void generateHeader(int REGWIDTH, int numExit) {
-                std::ofstream outFile("tmp.h");
-                std::string program;
-                for (auto varType = varTypeMap.begin(); varType != varTypeMap.end(); varType++) {
-                    program += "typedef struct {\n";
-                    auto varTypeName = varType->first;
-                    int totalSize = 0;
-                    std::string setFunction;
-                    for (auto field = varType->second->begin(); field != varType->second->end(); field++) {
-                        program += ("    sc_biguint<" + std::to_string(field->second) + "> " + field->first + ";\n");
-                        setFunction += ("        " + field->first + " = bv.range(" + std::to_string(totalSize+(field->second)-1) +
-                        ", " + std::to_string(totalSize) + ");\n");
-                        totalSize += field->second;
-                    }
-                    program += ("    void set(sc_biguint<" + std::to_string(totalSize) + "> bv) {\n");
-                    program += setFunction;
-                    program +=  "    }\n"
-                                "    sc_biguint<REG_WIDTH> to_uint() {\n"
-                                "        sc_biguint<REG_WIDTH> val = (";
-                    if (totalSize < REGWIDTH) {
-                        program += "0, ";
-                    }
-                    std::string tmp;
-                    for (auto field = varType->second->rbegin(); field != varType->second->rend(); field++) {
-                        tmp += (field->first + ", ");
-                    }
-                    program += tmp.substr(0, tmp.length()-2);
-                    program += ");\n        return val;\n    }\n} ";
-                    program += (varTypeName + ";\n\n");
-                }
-                outFile << program;
-                outFile << numExit << "\n";
-            }
-
-            BasicBlock* getInputDoneBB(Function &F) {
-                for (auto bb_it = F.begin(); bb_it != F.end(); bb_it++) {
-                    for (auto inst_it = bb_it->begin(); inst_it != bb_it->end(); inst_it++) {
-                        Instruction *inst = &*inst_it;
-                        if (isa<CallInst>(*inst)) {
-                            auto *tmp = dyn_cast<llvm::CallInst>(&*inst);
-                            Function* foo = tmp->getCalledFunction();
-                            if (foo->getName().contains("Input_done")) {
-                                if (DILocation *Loc = inst->getDebugLoc()) {
-                                    inputDoneLine = Loc->getLine();
-                                }
-                                return &*bb_it;
-                            }
-                        }
-                    }
-                }
-                return NULL;
-            }
-
-            int getInputLengthBB(BasicBlock &BB, int start) {
-                int index = start;
-                int totalLength = start;
-                bool hasInputHeader = false;
-                for (auto inst_it = BB.begin(); inst_it != BB.end(); inst_it++) {
-                    Instruction *inst = &*inst_it;
-                    if (isa<CallInst>(*inst)) {
-                        auto *tmp = dyn_cast<llvm::CallInst>(&*inst);
-                        Function *foo = tmp->getCalledFunction();
-                        if (foo->getName().contains("Input_header")) {
-                            // record debug info
-                            if (DILocation *Loc = inst->getDebugLoc()) {
-                                unsigned line = Loc->getLine();
-                                unsigned col = Loc->getColumn();
-                                inputInstLoc[line] = std::make_pair(col, &*inst);
-                            }
-                            hasInputHeader = true;
-
-                            Value* arg = tmp->getArgOperand(1);
-                            auto* argInt = dyn_cast<ConstantInt>(arg);
-                            int length = argInt->getSExtValue();
-                            // inst->print(errs());
-                            // errs() << "\n index: " << index << " length: " << length;
-                            if (index + length > IO_W) {
-                                inputInstRange[&*inst] = std::make_tuple(index, IO_W-1, index+length-IO_W-1);
-                                index = index+length-IO_W;
-                            } else {
-                                inputInstRange[&*inst] = std::make_tuple(index, index+length-1, -1);
-                                index = index+length;
-                            }
-                            totalLength = (totalLength+length >= IO_W) ? totalLength+length-IO_W : totalLength+length;
-                            // errs() << ", totalLength: " << totalLength << "\n";
-                        }
-                    }
-                }
-                if (hasInputHeader) {
-                    return totalLength;
-                }
-                else {
-                    return -1;
-                }
-            }
-
-            BasicBlock* inferInputFunctions(Function &F) {
-                std::vector<std::pair<BasicBlock*, int>> workstack;
-                std::set<Value*> visited; // visited and contains Input_head
-
-                BasicBlock *bb = &F.getEntryBlock();
-                int index = getInputLengthBB(*bb, 0);
-                workstack.emplace_back(bb, index);
-                if (index != -1) {
-                    visited.insert(bb);
-                }
-
-                BasicBlock *endBB;
-                if (!(endBB = getInputDoneBB(F))) {
-                    errs() << "Input_done not found!\n";
-                    exit(1);
-                }
-
-                while (!workstack.empty()) {
-                    auto bb_pair = workstack.back();
-                    workstack.pop_back();
-                    
-                    bb = bb_pair.first;
-                    index = bb_pair.second;
-                    for (auto succ = succ_begin(bb), succEnd = succ_end(bb); succ != succEnd; ++succ) {
-                        BasicBlock* bb_succ = *succ;
-                        int newIndex = getInputLengthBB(*bb_succ, index);
-                        if (newIndex != -1) {
-                            if (visited.find(&*bb_succ) != visited.end()) {
-                                printBasicBlock(*bb_succ);
-                                errs() << "Error: Input_header already visited in this basic block\n";
-                                exit(1);
-                            }
-                            visited.insert(bb_succ);
-                            if (bb_succ != endBB) {
-                                workstack.emplace_back(bb_succ, newIndex);
-                            }
-                        } else if (bb_succ != endBB) {
-                            workstack.emplace_back(bb_succ, index);
-                        }
-                    }
-                }
-
-                return endBB;
-            }
             
             virtual bool runOnModule(Module &M){
                 initializeProfData();
                 Function *main_func = initializeExeCount(M);
                 initializeBBLoc(*main_func);
                 initializeVarNames(*main_func);
-                BasicBlock *endBB = inferInputFunctions(*main_func);
                 livenessAnalysis(*main_func);
-                int numExit = extractInputFunction(*main_func, endBB);
-                generateHeader(192, numExit);
 
-                delete [] numInstPerSeg;
-                for (int i = 0; i < numProfSegments; i++) {
-                    delete [] profSegments[i];
-                }
-                delete [] profSegments;
-                for (int i = 0; i < numProfRegions; i++) {
-                    delete [] profRegions[i];
-                }
-                delete [] profRegions;
-                for (int i = 0; i < numProfBranches; i++) {
-                    delete [] profBranches[i];
-                }
-                delete [] profBranches;
+                BasicBlock *startBB, *endBB;
+                // inputGen::inferInputFunctions(*main_func, startBB, endBB);
+                // extractInputFunction(*main_func, endBB);
+
+                outputGen::inferOutputFunctions(*main_func, startBB, endBB);
+                outputGen::extractOutputFunction(*main_func, endBB);
+
+                delete bvIndexToInstrArg;
+                delete valueToBitVectorIndex;
+                delete instrInSet;
+                delete aliasMap;
+                delete branchLevel;
+                delete pointerMap;
                 primateCFG.close();
                 interconnectCFG.close();
                 primateHeader.close();

@@ -39,6 +39,8 @@ payload_t get_input(std::ifstream &infile);
 
 class primate_io {
     unsigned _BitInt(IO_W) input_buf;
+    unsigned pktID;
+    unsigned flits;
     int input_buf_len;
     int fifo_empty;
     bool last_buf;
@@ -64,6 +66,8 @@ public:
         fifo_empty = 0;
         last_buf = false;
         payload_v = false;
+        pktID = 0;
+        flits = 0;
         pkt_buf.clear();
         infile.open("input.txt");
         outfile.open("output.txt");
@@ -102,12 +106,19 @@ public:
                 last_buf = payload.last;
                 fifo_empty = 0;
                 payload = get_input(infile);
+                flits++;
             } else {
                 // fill input buffer
                 fifo_empty += (IO_BW - input_buf_len + shift);
                 input_buf_len = IO_BW;
             }
         }
+    }
+
+    template<typename h0_t, typename h1_t>
+    void Input_2header(const int length0, h0_t &header0, const int length1, h1_t &header1) {
+        Input_header<h0_t>(length0, header0);
+        Input_header<h1_t>(length1, header1);
     }
 
     void Input_done() {
@@ -118,6 +129,8 @@ public:
         pkt_buf.push_back(pl);
         input_buf_len = 0;
         fifo_empty = 0;
+        flits = 0;
+        pktID++;
         if (!last_buf) {
             pkt_buf.push_back(payload);
             payload_v = false;
@@ -131,6 +144,34 @@ public:
         }
     }
 
+    template<typename meta_t>
+    void Input_done(meta_t &metadata) {
+        payload_t pl;
+        pl.data = input_buf;
+        pl.empty = IO_BW - input_buf_len + fifo_empty;
+        pl.last = last_buf;
+        pkt_buf.push_back(pl);
+        metadata.empty = IO_BW - input_buf_len + fifo_empty;
+        metadata.pktID = pktID;
+        input_buf_len = 0;
+        fifo_empty = 0;
+        pktID++;
+        if (!last_buf) {
+            pkt_buf.push_back(payload);
+            payload_v = false;
+            bool is_last = payload.last;
+            while (!is_last) {
+                bool valid = false;
+                payload = get_input(infile);
+                flits++;
+                is_last = payload.last;
+                pkt_buf.push_back(payload);
+            }
+        }
+        metadata.flits = flits;
+        flits = 0;
+    }
+
     template<typename h_t>
     void Output_header(const int length, h_t &header) {
         payload_t pl;
@@ -138,6 +179,12 @@ public:
         pl.empty = IO_BW - length;
         pl.last = false;
         outfile << pl;
+    }
+
+    template<typename h0_t, typename h1_t>
+    void Output_2header(const int length0, h0_t &header0, const int length1, h1_t &header1) {
+        Output_header<h0_t>(length0, header0);
+        Output_header<h1_t>(length1, header1);
     }
 
     void Output_done() {
@@ -149,7 +196,7 @@ public:
 
     template<typename meta_t>
     void Output_meta(meta_t &standard_metadata) {
-        std::cout << "port: " << standard_metadata.egress_spec << std::endl;
+        std::cout << standard_metadata.egress_spec << std::endl;
     } //outputMeta inst
 
 };
