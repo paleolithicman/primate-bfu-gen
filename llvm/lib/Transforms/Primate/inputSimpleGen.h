@@ -1,41 +1,79 @@
-//	File "inputGen.h"
+//	File "inputSimpleGen.h"
 //	
 //  Author: Rui Ma
 ////////////////////////////////////////////////////////////////////////////////
-#ifndef __INPUTGEN_H__
-#define __INPUTGEN_H__
+#ifndef __INPUTSIMPLEGEN_H__
+#define __INPUTSIMPLEGEN_H__
 
 #include "PrimateBFUGenBase.h"
 
-#define IO_W 64
-#define RATE (0.07)
+#define IO_W 32
+#define RATE (0.01)
 
 using namespace llvm;
 
 namespace {
 
-class inputGen : virtual public PrimateBFUGenBase{
+class inputSimpleGen : virtual public PrimateBFUGenBase{
 public:
     // domain vector to store all definitions and function arguments
     int inputDoneLine;
 
     // tuple: start index; end index; end index of the second flit if the header spans across two flits, default -1
     ValueMap<Value*, std::tuple<int, int, int>> inputInstRange;
-    // TODO: line, col, Inst_ptr; assume each line has only one Input_header
-    std::map<int, std::pair<int, Value*>> inputInstLoc;
-    
-    inputGen() {}
+    // TODO: line, col, Inst_ptr, bfc_name, bfu_name; assume each line has only one Input_header
+    std::map<int, std::tuple<int, Value*, std::string, std::string>> blueInstLoc;
+    ValueMap<Value*, std::string> bfc2bfu;
 
-    ~inputGen(){}
+    // bfu_name, wb
+    std::map<std::string, bool> bfu_list;
+    // map<bfc_name, tuple<bfu_name, opcode, imm>>
+    std::map<std::string, std::tuple<std::string, int, int>> bfc_list;
+    std::set<std::string> bfu_covered;
+    std::set<std::string> bfu_not_fully_covered;
+
+    struct varMeta_t {
+        std::string name;
+        bool isInt;
+
+        varMeta_t(std::string name, bool isInt = false) : name(name), isInt(isInt) {}
+    };
+    
+    inputSimpleGen() {
+        bfu_list["lock"] = false;
+        bfc_list["primate_lock"] = std::make_tuple("lock", 0, 0);
+        bfc_list["primate_unlock"] = std::make_tuple("lock", 1, 0);
+
+        bfu_list["flow_table_read"] = true;
+        bfc_list["flow_table_read"] = std::make_tuple("flow_table_read", 0, 0);
+
+        bfu_list["flow_table_write"] = false;
+        bfc_list["flow_table_insert"] = std::make_tuple("flow_table_write", 1, 0);
+        bfc_list["flow_table_update"] = std::make_tuple("flow_table_write", 2, 0);
+        bfc_list["flow_table_delete"] = std::make_tuple("flow_table_write", 3, 0);
+        
+        bfu_list["dynamicMem"] = true;
+        bfc_list["dymem_new"] = std::make_tuple("dynamicMem", 0, 0);
+        bfc_list["dymem_lookup"] = std::make_tuple("dynamicMem", 1, 0);
+        bfc_list["dymem_update"] = std::make_tuple("dynamicMem", 2, 0);
+        bfc_list["dymem_free"] = std::make_tuple("dynamicMem", 3, 0);
+    }
+
+    ~inputSimpleGen(){}
 
     std::string generateInputMain(int numExit) {
         std::string program =   "#include \"inputUnit.h\"\n"
                                 "void inputUnit::inputUnit_main() {\n"
                                 "    primate_ctrl_iu::cmd_t cmd;\n\n"
                                 "    stream_in.reset();\n"
+                                "    stream_out.reset();\n"
                                 "    cmd_in.reset();\n"
-                                "    pkt_buf_out.reset();\n"
                                 "    bfu_out.reset();\n";
+
+        for (auto name = bfu_covered.begin(); name != bfu_covered.end(); name++) {
+            program += ("    " + (*name) + "_req.reset();\n");
+            program += ("    " + (*name) + "_rsp.reset();\n");
+        }
 
         for (int i = 0; i < numExit; i++) {
             program += ("    bt" + std::to_string(i) + " = 0;\n");
@@ -56,8 +94,26 @@ public:
         }
 
         program +=  "            }\n"
-                    "            wait();\n"
-                    "        } else {\n"
+                    "            bfu_out.write_last(tag, 0);\n";
+        
+        int i = 1;
+        for (auto name = bfu_not_fully_covered.begin(); name != bfu_not_fully_covered.end(); name++) {
+            program += ("        } else if (opcode & 0x30 == " + std::to_string(i << 4) + ") {\n");
+            program += ("            " + (*name) + "_req.write(bfu_in_pl_t(tag, opcode, cmd.ar_imm, cmd.ar_bits));\n");
+            program += ("            bfu_out_pl_t tmp = " + (*name) + "_rsp.read();\n");
+            if (bfu_list[*name]) {
+                program += ("            bfu_out.write_last(tag, 0);\n");
+            } else {
+                program += ("            bfu_out.write(tag, tmp.flag, cmd.ar_rd, tmp.bits, true);\n");
+            }
+            if (i > 3) {
+                errs() << "too many bfus not fully covered\n";
+                exit(1);
+            }
+            i++;
+        }
+
+        program +=  "        } else {\n"
                     "            inputUnit_core();\n"
                     "        }\n"
                     "    }\n"
@@ -132,72 +188,157 @@ public:
         return cost;
     }
 
+    std::string getVarMetaName(Value* op, std::string name) {
+        std::string res = name;
+        if (isa<AllocaInst>(*op)) {
+            auto *inst = dyn_cast<AllocaInst>(op);
+            res = (varNameMap[&*inst] + "." + res);
+        } else if (isa<GetElementPtrInst>(*op)) {
+            auto *inst = dyn_cast<GetElementPtrInst>(op);
+            Type *baseType = inst->getSourceElementType();
+            Value* baseVar = inst->getOperand(0);
+            unsigned idx = (dyn_cast<ConstantInt>(inst->getOperand(2)))->getZExtValue();
+            std::string typeName = (baseType->getStructName()).str();
+            typeName.erase(0, 7);
+            std::string fieldName = std::get<0>((*varTypeMap[typeName])[idx]);
+            // errs() << idx << " " << typeName << " " << fieldName << "\n";
+            res = (fieldName + "." + res);
+            res = getVarMetaName(baseVar, res);
+        }
+        return res;
+    }
+
+    varMeta_t* getVarMeta(Value* op) {
+        if (isa<AllocaInst>(*op)) {
+            auto *inst = dyn_cast<AllocaInst>(op);
+            Type *varType = inst->getAllocatedType();
+            std::string name = varNameMap[&*inst];
+            bool isInt = false;
+            if (varType->isIntegerTy()) {
+                isInt = true;
+            }
+            varMeta_t *res = new varMeta_t(name, isInt);
+            return res;
+        } else if (isa<GetElementPtrInst>(*op)) {
+            auto *inst = dyn_cast<GetElementPtrInst>(op);
+            Type *varType = inst->getResultElementType();
+            bool isInt = false;
+            if (varType->isIntegerTy()) {
+                isInt = true;
+            }
+            std::string name = getVarMetaName(op, "");
+            name.pop_back();
+            varMeta_t *res = new varMeta_t(name, isInt);
+            return res;
+        }
+        return NULL;
+    }
+
+    varMeta_t* getBFCInputMeta(Instruction* inst) {
+        if (isa<CallInst>(*inst)) {
+            auto *call = dyn_cast<llvm::CallInst>(&*inst);
+            if (call->arg_size() > 0) {
+                Value* op = call->getArgOperand(0);
+                return getVarMeta(op);
+            }
+        }
+        return NULL;
+    }
+
+    varMeta_t* getBFCOutputMeta(Instruction* inst) {
+        if (isa<CallInst>(*inst)) {
+            auto *call = dyn_cast<llvm::CallInst>(&*inst);
+            if (call->arg_size() > 1) {
+                Value* op = call->getArgOperand(1);
+                return getVarMeta(op);
+            }
+        }
+        return NULL;
+    }
+
     std::string translateSource(std::string source, int lineStart, int colStart) {
         std::string program;
         int line = lineStart;
         int col = colStart;
         std::istringstream iss(source);
         std::string lineBuf;
+        // errs() << "start translate:\n" << source << "\n";
         while (std::getline(iss, lineBuf)) {
-            auto inputInstMeta = inputInstLoc.find(line);
-            if (inputInstMeta != inputInstLoc.end()) {
-                Instruction *inst = dyn_cast<Instruction>((inputInstMeta->second).second);
+            auto blueInstMeta = blueInstLoc.find(line);
+            if (blueInstMeta != blueInstLoc.end()) {
+                std::string bfc_name = std::get<2>(blueInstMeta->second);
+                Instruction *inst = dyn_cast<Instruction>(std::get<1>(blueInstMeta->second));
                 // inst->print(errs());
                 // errs() << "\n";
-                // find input call location and get variable name
-                std::size_t index0 = lineBuf.find("top_intf.Input_header");
-                std::size_t index1 = lineBuf.find(",", index0);
-                std::size_t index2 = lineBuf.find(")", index0);
-                std::size_t index3 = lineBuf.find(";", index0);
-                std::string varName = lineBuf.substr(index1+1, index2-index1-1);
-                varName.erase(std::remove_if(varName.begin(), varName.end(), ::isspace), varName.end());
-                // construct substitution
-                std::string newCode;
-                auto instRange = inputInstRange[inst];
-                int buf0Start = std::get<0>(instRange);
-                int buf0End = std::get<1>(instRange);
-                int buf1End = std::get<2>(instRange);
-                if (buf0Start == 0) {
+                if (bfc_name.find("Input_simple") != std::string::npos) {
+                    // find input call location and get variable name
+                    std::size_t index0 = lineBuf.find("top_intf.Input_simple");
+                    std::size_t index1 = lineBuf.find("(", index0);
+                    std::size_t index2 = lineBuf.find(")", index0);
+                    std::size_t index3 = lineBuf.find(";", index0);
+                    std::string varName = lineBuf.substr(index1+1, index2-index1-1);
+                    varName.erase(std::remove_if(varName.begin(), varName.end(), ::isspace), varName.end());
+                    // construct substitution
+                    std::string newCode;
                     newCode += "payload = stream_in.read();\n";
-                    newCode += (varName + ".set(payload.data.range(" + std::to_string((buf0End+1)*8-1) + ", 0));\n");
-                    newCode += ("in_data_buf = payload.data;\nlast_buf = payload.last;\npkt_empty = " + 
-                        std::to_string(buf0End+1) + ";\npkt_data_buf = payload.data.range(" + 
-                        std::to_string(IO_W*8-1) + ", " + std::to_string((buf0End+1)*8) + ");");
-                } else if (buf1End != -1) {
-                    newCode += "payload = stream_in.read();\n";
-                    newCode += (varName + ".set((payload.data.range(" + std::to_string((buf1End+1)*8-1) + 
-                        ", 0), in_data_buf.range(" + std::to_string((buf0End+1)*8-1) + ", " + std::to_string(buf0Start*8) + ")));\n");
-                    newCode += ("in_data_buf = payload.data;\nlast_buf = payload.last;\npkt_empty = " + 
-                        std::to_string(buf1End+1) + ";\npkt_data_buf = payload.data.range(" + std::to_string(IO_W*8-1) +
-                        ", " + std::to_string((buf1End+1)*8) + ");");
-                } else {
-                    newCode += (varName + ".set(in_data_buf.range(" + std::to_string((buf0End+1)*8-1) + ", " + 
-                        std::to_string(buf0Start*8) + "));\n");
-                    newCode += ("pkt_empty = " + std::to_string(buf0End+1) + ";\npkt_data_buf = payload.data.range(" + 
-                        std::to_string(IO_W*8-1) + ", " + std::to_string((buf0End+1)*8) + ");");
-                }
+                    newCode += (varName + ".set(payload.data);\n");
 
-                // substitute the input call
-                lineBuf.replace(index0, index3-index0+1, newCode);
-                line++;
-            } else if (line == inputDoneLine) {
-                std::size_t index0 = lineBuf.find("top_intf.Input_done");
-                std::size_t index3 = lineBuf.find(";", index0);
+                    // substitute the input call
+                    lineBuf.replace(index0, index3-index0+1, newCode);
+                } else if (bfc_name.find("Output_simple") != std::string::npos) {
+                    std::size_t index0 = lineBuf.find("top_intf.Output_simple");
+                    std::size_t index1 = lineBuf.find("(", index0);
+                    std::size_t index2 = lineBuf.find(")", index0);
+                    std::size_t index3 = lineBuf.find(";", index0);
+                    std::string varName = lineBuf.substr(index1+1, index2-index1-1);
+                    varName.erase(std::remove_if(varName.begin(), varName.end(), ::isspace), varName.end());
+                    // construct substitution
+                    std::string newCode;
+                    newCode += ("stream_out.write(primate_io_payload_t(" + varName + ".to_uint(), tag, 0, true));\n");
+
+                    // substitute the output call
+                    lineBuf.replace(index0, index3-index0+1, newCode);
+                } else {
+                    std::string bfu_name = std::get<3>(blueInstMeta->second);
+                    std::size_t index0 = lineBuf.find(bfc_name);
+                    std::size_t index3 = lineBuf.find(";", index0);
+                    varMeta_t *varInMeta = getBFCInputMeta(inst);
+                    varMeta_t *varOutMeta = getBFCOutputMeta(inst);
+                    int opcode = std::get<1>(bfc_list[bfc_name]);
+                    int imm = std::get<2>(bfc_list[bfc_name]);
+
+                    std::string newCode;
+                    if (varInMeta != NULL) {
+                        newCode += (bfu_name + "_req.write(bfu_in_pl_t(tag, " + std::to_string(opcode) +
+                            ", " + std::to_string(imm) + ", " + varInMeta->name);
+                        if (!(varInMeta->isInt)) newCode += ".to_uint()";
+                    } else {
+                        newCode += (bfu_name + "_req.write(bfu_in_pl_t(tag, " + std::to_string(opcode) +
+                            ", " + std::to_string(imm) + ", 0");
+                    }
+                    newCode += "));\n";
+
+                    if (varOutMeta != NULL) {
+                        newCode += ("bfu_out_pl_t tmp = " + bfu_name + "_rsp.read();\n");
+                        if (varOutMeta->isInt) {
+                            newCode += (varOutMeta->name + " = tmp.bits;\n");
+                        } else {
+                            newCode += (varOutMeta->name + ".set(tmp.bits);\n");
+                        }
+                    } else {
+                        newCode += (bfu_name + "_rsp.read();\n");
+                    }
+                    lineBuf.replace(index0, index3-index0+1, newCode);
+                }
+            } else if ((lineBuf.find("return;") != std::string::npos) || (lineBuf.find("return ") != std::string::npos)) {
+                std::size_t index0 = lineBuf.find("return");
+                std::size_t index1 = lineBuf.find(";", index0);
                 std::string newCode;
-                newCode += ("payload.data = pkt_data_buf;\n"
-                        "    payload.empty = pkt_empty;\n"
-                        "    payload.last = last_buf;\n"
-                        "    pkt_buf_out.write(payload);\n"
-                        "    while (!last_buf) {\n"
-                        "        payload = stream_in.read();\n"
-                        "        last_buf = payload.last;\n"
-                        "        pkt_buf_out.write(payload);\n"
-                        "    }");
-                lineBuf.replace(index0, index3-index0+1, newCode);
-                line++;
-            } else {
-                line++;
+
+                newCode = "bfu_out.write_last(tag, bt0);\nreturn;\n";
+                lineBuf.replace(index0, index1-index0+1, newCode);
             }
+            line++;
             program += lineBuf;
             if (!iss.eof()) {
                 program += "\n";
@@ -207,11 +348,12 @@ public:
         return program;
     }
 
-    void extractInputFunction(Function &F, BasicBlock *endBB) {
+    void extractInputFunction(Function &F) {
         std::ifstream srcFile(filename);
         std::ofstream outFile("inputSpec.cpp");
         // double threshold = 0.5;
         // double nt = threshold * avgExeCountPerInst;
+        identifyBFCs(F);
 
         double threshold = exploreFunction(srcFile, 0.5, 0, 0);
         double nt = threshold * avgExeCountPerInst;
@@ -221,11 +363,7 @@ public:
         std::string program;
 
         program +=  "void inputUnit::inputUnit_core() {\n"
-                    "    primate_stream_512_4::payload_t payload;\n"
-                    "    sc_biguint<512> in_data_buf;\n"
-                    "    sc_biguint<512> pkt_data_buf;\n"
-                    "    bool last_buf;\n"
-                    "    sc_uint<8> pkt_empty;\n";
+                    "    primate_stream_512_4::payload_t payload;\n";
 
         int line = 1;
         int col = 1;
@@ -234,7 +372,6 @@ public:
         bool closeValid = false;
         int btID = 1;
         bool lastRemoved = false;
-        bool done;
         std::string sourceBuf;
         getSource(srcFile, sourceBuf, line, col, profSegments[0][0], profSegments[0][1]+1, "Input_done");
         col++; // skip the first "{"
@@ -245,7 +382,7 @@ public:
 
             int lineStart = line;
             int colStart = col;
-            done = getSource(srcFile, sourceBuf, line, col, profSegments[i+1][0], profSegments[i+1][1], "Input_done");
+            getSource(srcFile, sourceBuf, line, col, profSegments[i+1][0], profSegments[i+1][1], "Input_done");
             BasicBlock* BB = getBBfromLoc(profSegments[i][0], profSegments[i][1], profSegments[i+1][0], profSegments[i+1][1]);
 
             if (profSegments[i][2] < nt) {
@@ -259,8 +396,6 @@ public:
                             // Insert left bracket
                             program += "{\n";
                         }
-                        // Insert early exit statements
-                        // outFile << "cout << \"early exit\\n\";\n";
                         if (!getRegionCloseLoc(profSegments[i][0], profSegments[i][1], lineClose, colClose)) {
                             errs() << "unable to find the closing location of the region\n";
                         }
@@ -280,7 +415,7 @@ public:
                             prevBB = getBBfromLoc(profSegments[i-j][0], profSegments[i-j][1], profSegments[i-j+1][0], profSegments[i-j+1][1]);
                             j++;
                         }
-                        program += insertInputExit(BBset, &(F.getEntryBlock()), prevBB, nextBB, endBB, btID);
+                        program += insertInputExit(BBset, &(F.getEntryBlock()), prevBB, nextBB, btID);
                         btID++;
                         lastRemoved = true;
                         copyEn = false;
@@ -321,19 +456,18 @@ public:
 
             if (copyEn)
                 program += translateSource(sourceBuf, lineStart, colStart);
-            sourceBuf.clear();
-            if (done) break;
-        }
-        program += insertInputExit(BBset, &(F.getEntryBlock()), endBB, endBB, endBB, 0);
 
-        program += "}\n";
+            sourceBuf.clear();
+        }
+
+        identifyCoveredBFCs(F, BBset);
 
         std::string prologue = generateInputMain(btID);
         program = prologue + program;
 
         outFile << program;
 
-        generateInputHeader(192, btID);
+        generateInputHeader(272, btID);
 
     }
 
@@ -345,92 +479,61 @@ public:
         outFile << numExit << "\n";
     }
 
-    int getInputLengthBB(BasicBlock &BB, int start) {
-        int index = start;
-        int totalLength = start;
-        bool hasInputHeader = false;
-        for (auto inst_it = BB.begin(); inst_it != BB.end(); inst_it++) {
-            Instruction *inst = &*inst_it;
-            if (isa<CallInst>(*inst)) {
-                auto *tmp = dyn_cast<llvm::CallInst>(&*inst);
-                Function *foo = tmp->getCalledFunction();
-                if (foo->getName().contains("Input_header")) {
-                    // record debug info
+    void identifyBFCs(Function &F) {
+        for (BasicBlock &BB : F) {
+            for (auto inst_it = BB.begin(); inst_it != BB.end(); inst_it++) {
+                Instruction *inst = &*inst_it;
+                if (isa<CallInst>(*inst)) {
+                    auto *tmp = dyn_cast<llvm::CallInst>(&*inst);
+                    Function *foo = tmp->getCalledFunction();
+                    auto name = foo->getName();
                     if (DILocation *Loc = inst->getDebugLoc()) {
                         unsigned line = Loc->getLine();
                         unsigned col = Loc->getColumn();
-                        inputInstLoc[line] = std::make_pair(col, &*inst);
+                        if (name.contains("Input_simple")) {
+                            blueInstLoc[line] = std::make_tuple(col, &*inst, "Input_simple", "Input");
+                        } else if (name.contains("Output_simple")) {
+                            blueInstLoc[line] = std::make_tuple(col, &*inst, "Output_simple", "Output");
+                        } else {
+                            for (auto bfc_it = bfc_list.begin(); bfc_it != bfc_list.end(); bfc_it++) {
+                                std::string bfc_name = bfc_it->first;
+                                std::string bfu_name = std::get<0>(bfc_it->second);
+                                if (name.contains(bfc_name)) {
+                                    blueInstLoc[line] = std::make_tuple(col, &*inst, bfc_name, bfu_name);
+                                    if (bfc2bfu.find(&*inst) == bfc2bfu.end()) {
+                                        bfc2bfu[&*inst] = bfu_name;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
-                    hasInputHeader = true;
-
-                    Value* arg = tmp->getArgOperand(1);
-                    auto* argInt = dyn_cast<ConstantInt>(arg);
-                    int length = argInt->getSExtValue();
-                    // inst->print(errs());
-                    // errs() << "\n index: " << index << " length: " << length;
-                    if (index + length > IO_W) {
-                        inputInstRange[&*inst] = std::make_tuple(index, IO_W-1, index+length-IO_W-1);
-                        index = index+length-IO_W;
-                    } else {
-                        inputInstRange[&*inst] = std::make_tuple(index, index+length-1, -1);
-                        index = index+length;
-                    }
-                    totalLength = (totalLength+length >= IO_W) ? totalLength+length-IO_W : totalLength+length;
-                    // errs() << ", totalLength: " << totalLength << "\n";
                 }
             }
-        }
-        if (hasInputHeader) {
-            return totalLength;
-        }
-        else {
-            return -1;
         }
     }
 
-    BasicBlock* inferInputFunctions(Function &F, BasicBlock* &startBB, BasicBlock* &endBB) {
-        std::vector<std::pair<BasicBlock*, int>> workstack;
-        std::set<Value*> visited; // visited and contains Input_head
-
-        BasicBlock *bb = &F.getEntryBlock();
-        startBB = bb;
-        int index = getInputLengthBB(*bb, 0);
-        workstack.emplace_back(bb, index);
-        if (index != -1) {
-            visited.insert(bb);
-        }
-
-        if (!(endBB = getBBwithFunc(F, "Input_done", inputDoneLine))) {
-            errs() << "Input_done not found!\n";
-            exit(1);
-        }
-
-        while (!workstack.empty()) {
-            auto bb_pair = workstack.back();
-            workstack.pop_back();
-            
-            bb = bb_pair.first;
-            index = bb_pair.second;
-            for (auto succ = succ_begin(bb), succEnd = succ_end(bb); succ != succEnd; ++succ) {
-                BasicBlock* bb_succ = *succ;
-                int newIndex = getInputLengthBB(*bb_succ, index);
-                if (newIndex != -1) {
-                    if (visited.find(&*bb_succ) != visited.end()) {
-                        printBasicBlock(*bb_succ);
-                        errs() << "Error: Input_header already visited in this basic block\n";
-                        exit(1);
+    void identifyCoveredBFCs(Function &F, std::set<BasicBlock*> BBset) {
+        std::set<Value*> bfus;
+        for (BasicBlock &BB : F) {
+            if (BBset.find(&BB) != BBset.end()) {
+                for (Instruction &I : BB) {
+                    if (bfc2bfu.find(&I) != bfc2bfu.end()) {
+                        bfu_covered.insert(bfc2bfu[&I]);
+                        bfus.insert(&I);
                     }
-                    visited.insert(bb_succ);
-                    if (bb_succ != endBB) {
-                        workstack.emplace_back(bb_succ, newIndex);
-                    }
-                } else if (bb_succ != endBB) {
-                    workstack.emplace_back(bb_succ, index);
                 }
             }
         }
-
-        return endBB;
+        for (BasicBlock &BB : F) {
+            if (BBset.find(&BB) == BBset.end()) {
+                for (Instruction &I : BB) {
+                    if (bfus.find(&I) != bfus.end()) {
+                        bfu_not_fully_covered.insert(bfc2bfu[&I]);
+                    }
+                }
+            }
+        }
     }
 
     BitVector* getLiveoutVariables(std::set<BasicBlock*> &BBset, BasicBlock &nextBB) {
@@ -438,16 +541,21 @@ public:
         for (auto bb_it = BBset.begin(); bb_it != BBset.end(); bb_it++) {
             for (auto inst_it = (*bb_it)->begin(); inst_it != (*bb_it)->end(); inst_it++) {
                 Instruction *tempInst = &*inst_it;
+                // tempInst->print(errs());
+                // errs() << "\n";
                 if (isa<CallInst>(*tempInst)) {
                     // input header
                     auto *inst = dyn_cast<llvm::CallInst>(&*tempInst);
                     Function* foo = inst->getCalledFunction();
-                    if (foo->getName().contains("Input_header")) {
-                        Value* ptrOp = inst->getOperand(2);
+                    if (foo->getName().contains("Input_simple")) {
+                        Value* ptrOp = inst->getOperand(1);
                         (*updated)[(*valueToBitVectorIndex)[(*aliasMap)[ptrOp]]] = true;
-                        // tempInst->print(errs());
-                    } else if (foo->getName().contains("Input_done")) {
-                        break;
+                    } else if (!(foo->getName().contains("Output_simple"))) {
+                        // BFUs
+                        if (inst->arg_size() > 1) {
+                            Value* ptrOp = inst->getOperand(1);
+                            (*updated)[(*valueToBitVectorIndex)[(*aliasMap)[ptrOp]]] = true;
+                        }
                     }
                 } else if (isa<StoreInst>(*tempInst)) {
                     // store the struct
@@ -465,20 +573,19 @@ public:
         return updated;
     }
 
-    std::string insertInputExit(std::set<BasicBlock*> &BBset, BasicBlock* startBB, BasicBlock* endBB, BasicBlock* nextBB, BasicBlock* doneBB, int btID) {
+    std::string insertInputExit(std::set<BasicBlock*> &BBset, BasicBlock* startBB, BasicBlock* endBB, BasicBlock* nextBB, int btID) {
         std::set<BasicBlock*> intersect;
         std::set<BasicBlock*> reachable;
         std::vector<BasicBlock*> workstack;
         std::vector<BasicBlock*> path;
-        ValueMap<BasicBlock*, bool> visited;
+        std::set<BasicBlock*> visited;
 
-        visited[doneBB] = true;
         reachable.insert(endBB);
         workstack.emplace_back(startBB);
         while (!workstack.empty()) {
             BasicBlock *BB = workstack.back();
             workstack.pop_back();
-            visited[BB] = true;
+            visited.insert(BB);
 
             path.emplace_back(BB);
 
@@ -490,12 +597,18 @@ public:
                     }
                     path.clear();
                     continue;
-                } else if (!visited[bb_succ]) {
+                } else if (visited.find(bb_succ) == visited.end()) {
                     workstack.emplace_back(bb_succ);
                 }
             }
         }
 
+        if (!path.empty()) {
+            for (auto it = path.begin(); it != path.end(); it++) {
+                reachable.insert(*it);
+            }
+        }
+        
         for (auto bb_it = reachable.begin(); bb_it != reachable.end(); bb_it++) {
             if (BBset.find(*bb_it) != BBset.end()) {
                 intersect.insert(*bb_it);
@@ -543,6 +656,8 @@ public:
             exitCode.erase(exitCode.length()-3);
             exitCode += ", true);\n";
         }
+
+        exitCode += "return;\n";
         
         return exitCode;
     }

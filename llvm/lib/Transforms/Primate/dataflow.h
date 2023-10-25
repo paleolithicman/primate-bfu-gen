@@ -1,6 +1,9 @@
-//	File "dataflow.h"
-//	
-//	To perform backward and forward analysis of the source program
+//  File "dataflow.h"
+//  Based on code from Todd C. Mowry
+//  Modified by Arthur Peters
+//  Modified by Ankit Goyal
+//  Modified by Rui Ma
+//  To perform backward and forward analysis of the source program
 ////////////////////////////////////////////////////////////////////////////////
 
 #include<llvm/Pass.h>

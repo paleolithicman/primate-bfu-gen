@@ -31,13 +31,13 @@
 #include <tuple>
 #include <string>
 
-#define IO_W 64
+#include "PrimateBase.h"
 
 using namespace llvm;
 
 namespace {
 
-class PrimateBFUGenBase{
+class PrimateBFUGenBase : virtual public PrimateBase{
 public:
     std::string filename;
     unsigned long long numTotalInst;
@@ -55,7 +55,8 @@ public:
     std::map<int, std::map<int, Value*>*> lineToBBs;
     ValueMap<Value*, std::string> varNameMap;
     ValueMap<Value*, int> varRegMap;
-    std::map<std::string, std::vector<std::pair<std::string, int>>*> varTypeMap;
+    // map<type name, vector<field name, field width, field type name>>
+    std::map<std::string, std::vector<std::tuple<std::string, int, std::string>>*> varTypeMap;
 
     PrimateBFUGenBase() {}
 
@@ -122,8 +123,12 @@ public:
                             if (isa<IntegerType>(**elem)) {
                                 unsigned elemWidth = (*elem)->getIntegerBitWidth();
                                 fieldWidth.emplace_back(elemWidth);
+                            } else if (isa<StructType>(**elem)) {
+                                auto *struct_type = dyn_cast<StructType>(*elem);
+                                unsigned elemWidth = getStructWidth(*struct_type, 0, false);
+                                fieldWidth.emplace_back(elemWidth);
                             } else {
-                                errs() << "Each field must be integer type\n";
+                                errs() << "Each field must be integer or struct type\n";
                                 exit(1);
                             }
                         }
@@ -153,7 +158,7 @@ public:
                     }
                     if (varTypeMap.find(varTypeName) == varTypeMap.end()) {
                         if (varBaseType->getTag() == 0x0013) {  // The ID of DW_TAG_structure_type
-                            varTypeMap[varTypeName] = new std::vector<std::pair<std::string, int>>();
+                            varTypeMap[varTypeName] = new std::vector<std::tuple<std::string, int, std::string>>();
                             DINodeArray fieldArray = varBaseType->getElements();
                             int j = 0;
                             for (auto field_it = fieldArray.begin(); field_it != fieldArray.end(); field_it++) {
@@ -161,7 +166,14 @@ public:
                                     DIDerivedType* field = cast<DIDerivedType>(*field_it);
                                     if (field->getTag() == 0x000d) { // The ID of DW_TAG_member
                                         auto fieldName = field->getName();
-                                        varTypeMap[varTypeName]->emplace_back(std::make_pair(fieldName, fieldWidth[j]));
+                                        std::string fieldTypeName;
+                                        if (isa<DICompositeType>(*(field->getBaseType()))) {
+                                            auto *fieldType = cast<DICompositeType>(field->getBaseType());
+                                            if (fieldType->getTag() == 0x0013) {
+                                                fieldTypeName = fieldType->getName();
+                                            }
+                                        }
+                                        varTypeMap[varTypeName]->emplace_back(fieldName, fieldWidth[j], fieldTypeName);
                                         j++;
                                         // errs() << "Type: " << varTypeName << ", Field: " << fieldName << ", Size: " << field->getSizeInBits() << "\n";
                                     }
@@ -182,10 +194,20 @@ public:
             int totalSize = 0;
             std::string setFunction;
             for (auto field = varType->second->begin(); field != varType->second->end(); field++) {
-                program += ("    sc_biguint<" + std::to_string(field->second) + "> " + field->first + ";\n");
-                setFunction += ("        " + field->first + " = bv.range(" + std::to_string(totalSize+(field->second)-1) +
-                ", " + std::to_string(totalSize) + ");\n");
-                totalSize += field->second;
+                std::string fieldName = std::get<0>(*field);
+                int width = std::get<1>(*field);
+                std::string fieldTypeName = std::get<2>(*field);
+                if (fieldTypeName == "") {
+                    program += ("    sc_biguint<" + std::to_string(width) + "> " + fieldName + ";\n");
+                    setFunction += ("        " + fieldName + " = bv.range(" + std::to_string(totalSize+width-1) +
+                        ", " + std::to_string(totalSize) + ");\n");
+                    totalSize += width;
+                } else {
+                    program += ("    " + fieldTypeName + " " + fieldName + ";\n");
+                    setFunction += ("        " + fieldName + ".set(bv.range(" + std::to_string(totalSize+width-1) +
+                        ", " + std::to_string(totalSize) + "));\n");
+                    totalSize += width;
+                }
             }
             program += ("    void set(sc_biguint<" + std::to_string(totalSize) + "> bv) {\n");
             program += setFunction;
@@ -197,7 +219,13 @@ public:
             }
             std::string tmp;
             for (auto field = varType->second->rbegin(); field != varType->second->rend(); field++) {
-                tmp += (field->first + ", ");
+                std::string fieldName = std::get<0>(*field);
+                std::string fieldTypeName = std::get<2>(*field);
+                if (fieldTypeName == "") {
+                    tmp += (fieldName + ", ");
+                } else {
+                    tmp += (fieldName + ".to_uint(), ");
+                }
             }
             program += tmp.substr(0, tmp.length()-2);
             program += ");\n        return val;\n    }\n} ";
@@ -236,6 +264,7 @@ public:
 
     BasicBlock* getBBfromLoc(int lineStart, int colStart, int lineEnd, int colEnd) {
         if (lineToBBs.find(lineStart) != lineToBBs.end()) {
+            BasicBlock* lastBB;
             for (auto it = lineToBBs[lineStart]->begin(); it != lineToBBs[lineStart]->end(); it++) {
                 if (it->first >= colStart) {
                     return dyn_cast<BasicBlock>(it->second);
@@ -408,6 +437,20 @@ public:
         return NULL;
     }
 
+    bool checkInRegion(int line, int col, int lineStart, int colStart, int lineEnd, int colEnd) {
+        if (line < lineStart) {
+            return false;
+        } else if (line == lineStart && col < colStart) {
+            return false;
+        } else if (line == lineEnd && col > colEnd) {
+            return false;
+        } else if (line > lineEnd) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+
     bool checkRegionEntry(int segId) {
         if (profSegments[segId][4] != 0) {
             return true;
@@ -428,6 +471,21 @@ public:
             if ((profRegions[i][7] != 3) && (lineStart == profRegions[i][2]) && (colStart == profRegions[i][3])) {
                 return true;
             } else if (profRegions[i][0] > lineStart) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool getRegionCloseLoc(int line, int col, int &lineClose, int &colClose) {
+        // TODO: searching algorithm can be optimized
+        for (int i = 0; i < numProfRegions; i++) {
+            // skip gap region since they are always kept
+            if ((profRegions[i][7] != 3) && (line == profRegions[i][0]) && (col == profRegions[i][1])) {
+                lineClose = profRegions[i][2];
+                colClose = profRegions[i][3];
+                return true;
+            } else if (profRegions[i][0] > line) {
                 return false;
             }
         }
@@ -502,6 +560,46 @@ public:
         }
         return res;
     }
+
+    double exploreFunction(std::ifstream &profile, const double init_th, const int pos, const int segId) {
+        double th_old = init_th;
+        int count = 200;
+
+        // Simulated annealing algorithm
+        double cost_old = evalFunction(profile, th_old, pos, segId);
+        double th_best = th_old;
+        double cost_best = cost_old;
+
+        std::random_device rd;
+        std::mt19937_64 g(rd());
+
+        std::uniform_real_distribution<double> rf(0, 1);
+
+        for (; count > 0; --count) {
+            double th_new = nf<decltype(g)>(th_old, g);
+            double cost_new = evalFunction(profile, th_new, pos, segId);
+
+            // errs() << "new th: " << th_new << ", new cost: " << cost_new << ". ";
+
+            if (cost_new < cost_best) {
+                th_best = th_new;
+                cost_best = cost_new;
+            }
+
+            if (cost_new < cost_old || std::exp((cost_old - cost_new) / count) > rf(g)) {
+                // errs() << "move\n";
+                th_old = th_new;
+                cost_old = cost_new;
+            }
+        }
+        // errs() << "\n";
+
+        return th_best;
+    }
+
+protected:
+
+    virtual double evalFunction(std::ifstream &profile, double th, const int pos, const int segId) = 0;
 
 }; // class PrimateBFUGenBase
 }

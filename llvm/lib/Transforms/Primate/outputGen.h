@@ -1,15 +1,16 @@
 //	File "outputGen.h"
 //	
-//	To perform backward and forward analysis of the source program
+//  Author: Rui Ma
 ////////////////////////////////////////////////////////////////////////////////
 #ifndef __OUTPUTGEN_H__
 #define __OUTPUTGEN_H__
 
 #include "PrimateBFUGenBase.h"
 
-using namespace llvm;
+#define IO_W 64
+#define RATE (0.07)
 
-#define RATE (0.05)
+using namespace llvm;
 
 namespace {
 
@@ -221,42 +222,6 @@ public:
         return cost;
     }
 
-    double exploreFunction(std::ifstream &profile, const double init_th, const int pos, const int segId) {
-        double th_old = init_th;
-        int count = 100;
-
-        // Simulated annealing algorithm
-        double cost_old = evalFunction(profile, th_old, pos, segId);
-        double th_best = th_old;
-        double cost_best = cost_old;
-
-        std::random_device rd;
-        std::mt19937_64 g(rd());
-
-        std::uniform_real_distribution<double> rf(0, 1);
-
-        for (; count > 0; --count) {
-            double th_new = nf<decltype(g)>(th_old, g);
-            double cost_new = evalFunction(profile, th_new, pos, segId);
-
-            // errs() << "new th: " << th_new << ", new cost: " << cost_new << ". ";
-
-            if (cost_new < cost_best) {
-                th_best = th_new;
-                cost_best = cost_new;
-            }
-
-            if (cost_new < cost_old || std::exp((cost_old - cost_new) / count) > rf(g)) {
-                // errs() << "move\n";
-                th_old = th_new;
-                cost_old = cost_new;
-            }
-        }
-        // errs() << "\n";
-
-        return th_best;
-    }
-
     std::string translateReqSource(std::string source, int lineStart, int colStart) {
         std::string program;
         int line = lineStart;
@@ -455,6 +420,9 @@ public:
         srcFile.seekg(pos);
         int line = profSegments[segId][0];
         int col = profSegments[segId][1];
+        int lineClose = profSegments[segId][0];
+        int colClose = profSegments[segId][1];
+        bool closeValid = false;
         int btID = 1;
         bool lastRemoved = false;
         bool done = false;
@@ -483,6 +451,11 @@ public:
                             program_req += "{\n";
                             program_rsp += "{\n";
                         }
+                        if (!getRegionCloseLoc(profSegments[i][0], profSegments[i][1], lineClose, colClose)) {
+                            errs() << "unable to find the closing location of the region\n";
+                        }
+                        // errs() << "lineClose: " << lineClose << ", colClose: " << colClose << "\n";
+                        closeValid = true;
                         // Insert early exit statements
                         // outFile << "cout << \"early exit\\n\";\n";
                         program_rsp += insertOutputExit(btID);
@@ -495,8 +468,20 @@ public:
                         copyEn = true;
                     }
                 } else {
-                    lastRemoved = true;
-                    copyEn = false;
+                    if (closeValid && checkInRegion(lineClose, colClose, profSegments[i][0], 
+                        profSegments[i][1], profSegments[i+1][0], profSegments[i+1][1])) {
+                        closeValid = false;
+                        if (sourceBuf.find("else") != std::string::npos) {
+                            lastRemoved = false;
+                            copyEn = true;
+                        } else {
+                            lastRemoved = true;
+                            copyEn = false;
+                        }
+                    } else {
+                        lastRemoved = true;
+                        copyEn = false;
+                    }
                 }
             } else {
                 // Keep the segment
@@ -682,13 +667,52 @@ public:
         }
     }
 
-    protected:
-    
-    virtual int getRegIdx(Value* var) = 0;
+    BitVector* getLiveinVariables(std::set<BasicBlock*> &BBset) {
+        BitVector* referred = new BitVector(domainSize, false);
+        for (auto bb_it = BBset.begin(); bb_it != BBset.end(); bb_it++) {
+            BitVector *liveins = (*in)[*bb_it];
+            BitVector *liveouts = (*out)[*bb_it];
+            (*liveins) &= ((*liveouts).flip());
+            (*referred) |= (*liveins);
+        }
+        return referred;
+    }
 
-    virtual void initializeLiveinVars(BitVector* referred) = 0;
-    
-    virtual BitVector* getLiveinVariables(std::set<BasicBlock*> &BBset) = 0;
+    void initializeLiveinVars(BitVector* referred) {
+        for (int i=0; i < referred->size(); i++) {
+            if ( (*referred)[i] ) {
+                Value *var = (*bvIndexToInstrArg)[i];
+                bool isInt = false;
+                int width = 0;
+                if (isa<AllocaInst>(*var)) {
+                    auto *inst = dyn_cast<AllocaInst>(var);
+                    Type *varType = inst->getAllocatedType();
+                    if (isa<IntegerType>(*varType)) {
+                        isInt = true;
+                        auto* varIntType = dyn_cast<IntegerType>(varType);
+                        width = varIntType->getBitWidth();
+                    }
+                }
+                if (varNameMap.find(var) != varNameMap.end()) {
+                    std::string name = varNameMap[var];
+                    if (isInt) {
+                        liveinVars.insert(std::make_pair(name, width));
+                    }
+                }
+            }
+        }
+    }
+
+    int getRegIdx(Value* var) {
+        Value *rootVar = (*aliasMap)[var];
+        if (varRegMap.find(rootVar) != varRegMap.end()) {
+            return varRegMap[rootVar];
+        } else {
+            errs() << "Error: Can't get the register index of the variable.\n";
+            return 0;
+        }
+    }
+
 };
 }
 

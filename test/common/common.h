@@ -7,9 +7,13 @@
 #include <vector>
 #include <string>
 
-#define IO_W 512
-#define IO_BW 64
-#define IO_BW_LG 6
+//#define IO_W 512
+//#define IO_BW 64
+//#define IO_BW_LG 6
+
+#define IO_W 256
+#define IO_BW 32
+#define IO_BW_LG 5
 
 struct payload_t {
     unsigned _BitInt(IO_W) data;
@@ -18,22 +22,24 @@ struct payload_t {
 
     inline friend std::ostream& operator<<(std::ostream& os, const payload_t& val) {
         long long unsigned int array[IO_W/64];
-        _BitInt(IO_W) tmp = val.data;
+        unsigned _BitInt(IO_W) tmp = val.data;
         for (int i = 0; i < IO_W/64; i++) {
             array[i] = tmp;
             tmp = tmp >> 64;
         }
         os << std::hex << "data = ";
         for (int i = IO_W/64-1; i >= 0; i--) {
-            // os << std::setw(16) << std::setfill('0') << array[i];
-            os << array[i];
+            os << std::setw(16) << std::setfill('0') << array[i];
+            // os << array[i];
         }
         os << std::dec << "; empty = " << val.empty << "; last = " << val.last << std::endl;
         return os;
     }
 };
 
-unsigned _BitInt(512) str2biguint(std::string data);
+std::ostream& operator<<(std::ostream& os, const unsigned _BitInt(IO_W) &val);
+
+unsigned _BitInt(IO_W) str2biguint(std::string data);
 
 payload_t get_input(std::ifstream &infile);
 
@@ -93,11 +99,12 @@ public:
 
             // shift and fill input buffer
             // std::cout << "input_buf_len: " << input_buf_len << ", shift: " << shift << ", fifo_empty: " << fifo_empty << std::endl;
-            if (input_buf_len == 0) {
+            // std::cout << "input_buf: " << input_buf << std::endl;
+            if (input_buf_len == 0 || (input_buf_len == shift)) {
                 input_buf = payload.data;
             } else {
                 input_buf = ((payload.data >> (fifo_empty*8)) << (input_buf_len*8 - shift*8)) | 
-                    ((input_buf << (512 - input_buf_len*8)) >> (512 - input_buf_len*8 + shift*8));
+                    ((input_buf << (IO_W - input_buf_len*8)) >> (IO_W - input_buf_len*8 + shift*8));
             }
 
             if (input_buf_len - shift <= fifo_empty) {
@@ -121,27 +128,34 @@ public:
         Input_header<h1_t>(length1, header1);
     }
 
+    template<typename h_t>
+    void Input_simple(h_t &header) {
+        Input_header<h_t>(IO_BW, header);
+    }
+
     void Input_done() {
-        payload_t pl;
-        pl.data = input_buf;
-        pl.empty = IO_BW - input_buf_len + fifo_empty;
-        pl.last = last_buf;
-        pkt_buf.push_back(pl);
-        input_buf_len = 0;
-        fifo_empty = 0;
-        flits = 0;
-        pktID++;
-        if (!last_buf) {
-            pkt_buf.push_back(payload);
-            payload_v = false;
-            bool is_last = payload.last;
-            while (!is_last) {
-                bool valid = false;
-                payload = get_input(infile);
-                is_last = payload.last;
+        if (fifo_empty != 0) {
+            payload_t pl;
+            pl.data = input_buf;
+            pl.empty = IO_BW - input_buf_len + fifo_empty;
+            pl.last = last_buf;
+            pkt_buf.push_back(pl);
+            input_buf_len = 0;
+            fifo_empty = 0;
+            if (!last_buf) {
                 pkt_buf.push_back(payload);
+                payload_v = false;
+                bool is_last = payload.last;
+                while (!is_last) {
+                    bool valid = false;
+                    payload = get_input(infile);
+                    is_last = payload.last;
+                    pkt_buf.push_back(payload);
+                }
             }
         }
+        flits = 0;
+        pktID++;
     }
 
     template<typename meta_t>
@@ -178,6 +192,9 @@ public:
         pl.data = header.to_uint();
         pl.empty = IO_BW - length;
         pl.last = false;
+        if (pkt_buf.empty()) {
+            pl.last = true;
+        }
         outfile << pl;
     }
 
@@ -185,6 +202,11 @@ public:
     void Output_2header(const int length0, h0_t &header0, const int length1, h1_t &header1) {
         Output_header<h0_t>(length0, header0);
         Output_header<h1_t>(length1, header1);
+    }
+
+    template<typename h_t>
+    void Output_simple(h_t &header) {
+        Output_header<h_t>(IO_BW, header);
     }
 
     void Output_done() {
