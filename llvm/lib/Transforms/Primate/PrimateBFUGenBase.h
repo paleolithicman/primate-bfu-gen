@@ -172,6 +172,11 @@ public:
                                             if (fieldType->getTag() == 0x0013) {
                                                 fieldTypeName = fieldType->getName();
                                             }
+                                        } else if (isa<DIDerivedType>(*(field->getBaseType()))) {
+                                            auto *fieldType = cast<DIDerivedType>(field->getBaseType());
+                                            if (fieldType->getTag() == 0x16) { // The ID of DW_TAG_typedef
+                                                fieldTypeName = fieldType->getName();
+                                            }
                                         }
                                         varTypeMap[varTypeName]->emplace_back(fieldName, fieldWidth[j], fieldTypeName);
                                         j++;
@@ -212,23 +217,31 @@ public:
             program += ("    void set(sc_biguint<" + std::to_string(totalSize) + "> bv) {\n");
             program += setFunction;
             program +=  "    }\n"
-                        "    sc_biguint<REG_WIDTH> to_uint() {\n"
-                        "        sc_biguint<REG_WIDTH> val = (";
+                        "    sc_biguint<REG_WIDTH> to_uint() {\n";
+                        
+            std::string subprogram = "        sc_biguint<REG_WIDTH> val = (";
             if (totalSize < REGWIDTH) {
-                program += "0, ";
+                subprogram += "0, ";
             }
             std::string tmp;
+            std::string tmp2;
+            int i = 0;
             for (auto field = varType->second->rbegin(); field != varType->second->rend(); field++) {
                 std::string fieldName = std::get<0>(*field);
+                int width = std::get<1>(*field);
                 std::string fieldTypeName = std::get<2>(*field);
                 if (fieldTypeName == "") {
                     tmp += (fieldName + ", ");
                 } else {
-                    tmp += (fieldName + ".to_uint(), ");
+                    tmp2 += "        sc_biguint<" + std::to_string(width) + "> tmp" + std::to_string(i) + " = " + fieldName + ".to_uint();\n";
+                    tmp += ("tmp" + std::to_string(i) + ", ");
                 }
+                i++;
             }
-            program += tmp.substr(0, tmp.length()-2);
-            program += ");\n        return val;\n    }\n} ";
+            subprogram += tmp.substr(0, tmp.length()-2);
+            subprogram += ");\n";
+            program += (tmp2 + subprogram);
+            program += "        return val;\n    }\n} ";
             program += (varTypeName + ";\n\n");
         }
         

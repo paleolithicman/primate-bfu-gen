@@ -79,6 +79,23 @@ typedef struct {
 } header_t;
 
 typedef struct {
+    header_t hdr0;
+    header_t hdr1;
+
+    inline void set(unsigned _BitInt(128) bv) {
+        hdr0.set(bv);
+        hdr1.set(bv >> 64);
+    }
+
+    inline unsigned _BitInt(REG_WIDTH) to_uint() {
+        unsigned _BitInt(64) hdr0_uint = hdr0.to_uint();
+        unsigned _BitInt(64) hdr1_uint = hdr1.to_uint();
+        unsigned _BitInt(REG_WIDTH) val = ((_BitInt(REG_WIDTH))hdr1_uint << 64) | (_BitInt(REG_WIDTH))hdr0_uint;
+        return val;
+    }
+} header2_t;
+
+typedef struct {
     unsigned _BitInt(72) version_ttl;
     unsigned _BitInt(8) protocol;
     unsigned _BitInt(80) hdrChecksum_dstAddr;

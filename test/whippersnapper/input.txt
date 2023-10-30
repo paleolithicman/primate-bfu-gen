@@ -1,1 +1,1 @@
-../data/input_mix2048.txt
+../data/input_8.txt

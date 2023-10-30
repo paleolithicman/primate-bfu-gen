@@ -9,14 +9,10 @@ void primate_main(primate_io &top_intf) {
     ipv4_t ipv4;
     tcp_t tcp;
     udp_t udp;
-    header_t header_0;
-    header_t header_1;
-    header_t header_2;
-    header_t header_3;
-    header_t header_4;
-    header_t header_5;
-    header_t header_6;
-    header_t header_7;
+    header2_t header_0;
+    header2_t header_1;
+    header2_t header_2;
+    header2_t header_3;
 
     hdr_count = 0;
     top_intf.Input_header<ethernet_t>(14, eth);
@@ -25,28 +21,28 @@ void primate_main(primate_io &top_intf) {
         top_intf.Input_header<ptp_h_t>(24, ptp_h);
         hdr_count = 1;
         if (ptp_l.reserved2 == 1) {
-            top_intf.Input_header<header_t>(8, header_0);
+            top_intf.Input_header<header_t>(8, header_0.hdr0);
             hdr_count = 2;
-            if (header_0.field_0 != 0) {
-                top_intf.Input_header<header_t>(8, header_1);
+            if (header_0.hdr0.field_0 != 0) {
+                top_intf.Input_header<header_t>(8, header_0.hdr1);
                 hdr_count = 3;
-                if (header_1.field_0 != 0) {
-                    top_intf.Input_header<header_t>(8, header_2);
+                if (header_0.hdr1.field_0 != 0) {
+                    top_intf.Input_header<header_t>(8, header_1.hdr0);
                     hdr_count = 4;
-                    if (header_2.field_0 != 0) {
-                        top_intf.Input_header<header_t>(8, header_3);
+                    if (header_1.hdr0.field_0 != 0) {
+                        top_intf.Input_header<header_t>(8, header_1.hdr1);
                         hdr_count = 5;
-                        if (header_3.field_0 != 0) {
-                            top_intf.Input_header<header_t>(8, header_4);
+                        if (header_1.hdr1.field_0 != 0) {
+                            top_intf.Input_header<header_t>(8, header_2.hdr0);
                             hdr_count = 6;
-                            if (header_4.field_0 != 0) {
-                                top_intf.Input_header<header_t>(8, header_5);
+                            if (header_2.hdr0.field_0 != 0) {
+                                top_intf.Input_header<header_t>(8, header_2.hdr1);
                                 hdr_count = 7;
-                                if (header_5.field_0 != 0) {
-                                    top_intf.Input_header<header_t>(8, header_6);
+                                if (header_2.hdr1.field_0 != 0) {
+                                    top_intf.Input_header<header_t>(8, header_3.hdr0);
                                     hdr_count = 8;
-                                    if (header_6.field_0 != 0) {
-                                        top_intf.Input_header<header_t>(8, header_7);
+                                    if (header_3.hdr0.field_0 != 0) {
+                                        top_intf.Input_header<header_t>(8, header_3.hdr1);
                                         hdr_count = 9;
                                     }
                                 }
@@ -92,30 +88,32 @@ void primate_main(primate_io &top_intf) {
         top_intf.Output_2header<ptp_l_t, ptp_h_t>(20, ptp_l, 24, ptp_h);
         if (hdr_count > 1) {
             if (hdr_count > 2) {
-                top_intf.Output_2header<header_t, header_t>(8, header_0, 8, header_1);
                 if (hdr_count > 3) {
                     if (hdr_count > 4) {
-                        top_intf.Output_2header<header_t, header_t>(8, header_2, 8, header_3);
+                        top_intf.Output_2header<header2_t, header2_t>(16, header_0, 16, header_1);
                         if (hdr_count > 5) {
                             if (hdr_count > 6) {
-                                top_intf.Output_2header<header_t, header_t>(8, header_4, 8, header_5);
                                 if (hdr_count > 7) {
                                     if (hdr_count > 8) {
-                                        top_intf.Output_2header<header_t>(8, header_6, 8, header_7);
+                                        top_intf.Output_2header<header2_t>(16, header_2, 16, header_3);
                                     } else {
-                                        top_intf.Output_header<header_t>(8, header_6);
+                                        top_intf.Output_2header<header2_t>(16, header_2, 8, header_3);
                                     }
+                                } else {
+                                    top_intf.Output_header<header2_t>(16, header_2);
                                 }
                             } else {
-                                top_intf.Output_header<header_t>(8, header_4);
+                                top_intf.Output_header<header2_t>(8, header_2);
                             }
                         }
                     } else {
-                        top_intf.Output_header<header_t>(8, header_2);
+                        top_intf.Output_2header<header2_t, header2_t>(16, header_0, 8, header_1);
                     }
+                } else {
+                    top_intf.Output_header<header2_t>(16, header_0);
                 }
             } else {
-                top_intf.Output_header<header_t>(8, header_0);
+                top_intf.Output_header<header2_t>(8, header_0);
             }
         }
     } else {
